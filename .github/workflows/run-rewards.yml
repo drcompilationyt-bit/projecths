@@ -133,3 +133,4 @@ jobs:
         with:
           name: microsoft-rewards-logs-${{ github.run_id }}
           path: logs/script.log
+          
