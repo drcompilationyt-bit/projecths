@@ -74,7 +74,8 @@ jobs:
         run: |
           mkdir -p src
           if [ -z "${{ secrets.ACCOUNTS_JSON }}" ]; then
-            echo "ERROR: ACCOUNTS_JSON secret is empty. Add your src/accounts.json content to the secret named ACCOUNTS_JSON."; exit 1
+            echo "ERROR: ACCOUNTS_JSON secret is empty. Add your src/accounts.json content to the secret named ACCOUNTS_JSON."
+            exit 1
           fi
           printf '%s' "${{ secrets.ACCOUNTS_JSON }}" > src/accounts.json
           echo "wrote src/accounts.json (not committed) - size: $(wc -c < src/accounts.json) bytes"
