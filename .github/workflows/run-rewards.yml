@@ -1,4 +1,4 @@
-name: Run Microsoft Rewards Script (daily random 07-10 ET with jitter & deps check)
+name: Run Microsoft Rewards Script (daily random 07-10 ET with jitter)
 
 on:
   schedule:
@@ -29,46 +29,44 @@ jobs:
       - name: Decide whether this scheduled run should execute (slot selection in America/Toronto)
         shell: bash
         run: |
-          read SLOT HOUR <<'PYOUT'
-$(python3 - <<'PY'
-from zoneinfo import ZoneInfo
-import hashlib, datetime
-tz = ZoneInfo('America/Toronto')
-now = datetime.datetime.now(tz)
-s = now.strftime('%Y-%m-%d')
-slot = int(hashlib.sha256(s.encode()).hexdigest(), 16) % 4
-hour = now.strftime('%H')
-print(f"{slot} {hour}")
-PY
-)
-PYOUT
-          echo "Toronto local hour: $HOUR ; slot for today: $SLOT"
-          case "$HOUR" in
+          # Toronto local date and hour
+          LOCAL_DATE=$(TZ='America/Toronto' date +%F)
+          LOCAL_HOUR=$(TZ='America/Toronto' date +%H)
+          echo "Toronto local date: $LOCAL_DATE  hour: $LOCAL_HOUR"
+
+          # Deterministic slot (0..3) from the date using sha256 last hex nibble
+          HASH=$(printf '%s' "$LOCAL_DATE" | sha256sum | awk '{print $1}')
+          LAST_HEX=${HASH: -1}
+          SLOT=$((16#$LAST_HEX % 4))
+          echo "Slot for today (0..3): $SLOT"
+
+          # Map local hour to expected slot index (07->0, 08->1, 09->2, 10->3)
+          case "$LOCAL_HOUR" in
             07) EXPECTED=0 ;;
             08) EXPECTED=1 ;;
             09) EXPECTED=2 ;;
             10) EXPECTED=3 ;;
-            *) echo "Local hour $HOUR not in 07-10 ET; exiting quickly."; exit 0 ;;
+            *) echo "Local hour $LOCAL_HOUR not in 07-10 ET; exiting quickly."; exit 0 ;;
           esac
+
+          echo "Expected slot for this hour: $EXPECTED"
           if [ "$SLOT" -ne "$EXPECTED" ]; then
-            echo "Not this hour's chosen run — exiting quickly."
+            echo "Not this hour's chosen run — exiting quickly to save runner time."
             exit 0
           fi
+
           echo "This job won the day's slot (Toronto time) — continuing."
 
       - name: Winning job: compute jitter (0-59 minutes) in Toronto and sleep
         shell: bash
         run: |
-          JITTER_MIN=$(python3 - <<'PY'
-from zoneinfo import ZoneInfo
-import hashlib, datetime
-tz = ZoneInfo('America/Toronto')
-now = datetime.datetime.now(tz)
-s = now.strftime('%Y-%m-%d') + now.strftime('%H')
-print(int(hashlib.sha256(s.encode()).hexdigest(), 16) % 60)
-PY
-)
-          echo "Sleeping for $JITTER_MIN minute(s) (Toronto local jitter)."
+          LOCAL_DATE=$(TZ='America/Toronto' date +%F)
+          LOCAL_HOUR=$(TZ='America/Toronto' date +%H)
+          HASH2=$(printf '%s' "${LOCAL_DATE}${LOCAL_HOUR}" | sha256sum | awk '{print $1}')
+          LAST2=${HASH2: -2}
+          DEC=$((16#$LAST2))
+          JITTER_MIN=$((DEC % 60))
+          echo "Sleeping for $JITTER_MIN minute(s) (Toronto local jitter) before starting work."
           sleep $((JITTER_MIN * 60))
 
       - name: Create src/accounts.json from secret
@@ -79,16 +77,16 @@ PY
             echo "ERROR: ACCOUNTS_JSON secret is empty. Add your src/accounts.json content to the secret named ACCOUNTS_JSON."; exit 1
           fi
           printf '%s' "${{ secrets.ACCOUNTS_JSON }}" > src/accounts.json
-          echo "wrote src/accounts.json - size: $(wc -c < src/accounts.json) bytes"
+          echo "wrote src/accounts.json (not committed) - size: $(wc -c < src/accounts.json) bytes"
 
       - name: Optionally create src/config.json from secret (if provided)
         shell: bash
         run: |
           if [ -n "${{ secrets.CONFIG_JSON }}" ]; then
             printf '%s' "${{ secrets.CONFIG_JSON }}" > src/config.json
-            echo "wrote src/config.json from secret - size: $(wc -c < src/config.json) bytes"
+            echo "wrote src/config.json from secret (size: $(wc -c < src/config.json) bytes)"
           else
-            echo "CONFIG_JSON secret not provided; using repo's config.json if present."
+            echo "CONFIG_JSON secret not provided; using repo's config.json (if present)."
           fi
 
       - name: Install OS packages required by browsers (Playwright)
@@ -99,32 +97,27 @@ PY
             libasound2 libxcomposite1 libxdamage1 libxrandr2 libgtk-3-0 libgbm1 \
             ca-certificates fonts-liberation libappindicator3-1 libatspi2.0-0 \
             lsb-release
-          echo "Installed common Playwright OS deps."
 
       - name: Install Node dependencies (clean)
         run: |
           npm ci
           echo "node: $(node -v); npm: $(npm -v)"
-          echo "Top-level packages installed:"
           npm ls --depth=0 || true
 
       - name: Verify TypeScript / build tools present (install if missing)
         shell: bash
         run: |
-          # If tsc is not available from local node_modules, install TypeScript as dev dependency and continue.
           if ! npx --no-install tsc --version >/dev/null 2>&1; then
             echo "TypeScript not found. Installing locally as devDependency..."
             npm i -D typescript@latest
-            echo "Re-listing packages:"
             npm ls --depth=0 || true
           else
-            echo "TypeScript present; ok."
+            echo "TypeScript present."
             npx tsc --version || true
           fi
 
       - name: Install Playwright browser(s)
         run: |
-          # installs Chromium with OS deps; adjust if you need webkit/firefox too
           npx playwright install --with-deps chromium
 
       - name: Build the project (per README)
