@@ -1,0 +1,110 @@
+name: Run Microsoft Rewards Script (daily random 07-10 with jitter)
+
+on:
+  schedule:
+    - cron: '0 7 * * *'
+    - cron: '0 8 * * *'
+    - cron: '0 9 * * *'
+    - cron: '0 10 * * *'
+  workflow_dispatch: {}
+
+jobs:
+  run-rewards:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360   # GitHub-hosted max = 360 minutes (6 hours)
+    env:
+      NODE_VERSION: '18'
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Decide whether this scheduled run should execute (slot selection)
+        shell: bash
+        run: |
+          # deterministic slot for the UTC date (0..3)
+          SLOT=$(python3 - <<'PY'
+import hashlib, datetime
+s = datetime.datetime.utcnow().strftime('%Y-%m-%d')
+print(int(hashlib.sha256(s.encode()).hexdigest(), 16) % 4)
+PY
+)
+          HOUR=$(date -u +%H)
+          echo "UTC hour: $HOUR ; slot for today: $SLOT"
+          case "$HOUR" in
+            07) EXPECTED=0 ;;
+            08) EXPECTED=1 ;;
+            09) EXPECTED=2 ;;
+            10) EXPECTED=3 ;;
+            *) echo "Not one of scheduled hours; exiting."; exit 0 ;;
+          esac
+          echo "expected slot index for this hour: $EXPECTED"
+          if [ "$SLOT" -ne "$EXPECTED" ]; then
+            echo "Not this hour's chosen run — skipping quickly (no wasted runtime)."
+            exit 0
+          fi
+          echo "This job won the day's slot — continuing."
+
+      - name: Winning job: compute jitter (0-59 minutes) and sleep
+        if: always()
+        shell: bash
+        run: |
+          # Only run this for the winning job (the previous step exits early for losers).
+          # compute deterministic jitter 0..59 from the UTC date + hour so it's reproducible
+          JITTER_MIN=$(python3 - <<'PY'
+import hashlib, datetime
+s = datetime.datetime.utcnow().strftime('%Y-%m-%d') + datetime.datetime.utcnow().strftime('%H')
+print(int(hashlib.sha256(s.encode()).hexdigest(), 16) % 60)
+PY
+)
+          echo "Sleeping for $JITTER_MIN minute(s) before starting work (this gives a time in the chosen hour)."
+          sleep $((JITTER_MIN * 60))
+
+      - name: Create src/accounts.json from secret
+        shell: bash
+        run: |
+          mkdir -p src
+          if [ -z "${{ secrets.ACCOUNTS_JSON }}" ]; then
+            echo "ERROR: ACCOUNTS_JSON secret is empty. Add your src/accounts.json content to the secret named ACCOUNTS_JSON."; exit 1
+          fi
+          printf '%s' "${{ secrets.ACCOUNTS_JSON }}" > src/accounts.json
+          echo "wrote src/accounts.json (not committed) - size: $(wc -c < src/accounts.json) bytes"
+
+      - name: Optionally create src/config.json from secret (if provided)
+        shell: bash
+        run: |
+          if [ -n "${{ secrets.CONFIG_JSON }}" ]; then
+            printf '%s' "${{ secrets.CONFIG_JSON }}" > src/config.json
+            echo "wrote src/config.json from secret (size: $(wc -c < src/config.json) bytes)"
+          else
+            echo "CONFIG_JSON secret not provided; using repo's config.json (if present)."
+          fi
+
+      - name: Install Node dependencies
+        run: npm ci
+
+      - name: Install Playwright browser dependencies (Chromium)
+        run: |
+          npx playwright install --with-deps chromium
+
+      - name: Build the project (per README)
+        run: npm run build
+
+      - name: Run the built script and save logs
+        shell: bash
+        run: |
+          mkdir -p logs
+          npm run start 2>&1 | tee logs/script.log || true
+          echo "Check logs/script.log for full output."
+
+      - name: Upload logs artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: microsoft-rewards-logs-${{ github.run_id }}
+          path: logs/script.log
