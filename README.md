@@ -1,7 +1,4 @@
-# Microsoft-Rewards-Script
-Automated Microsoft Rewards script, however this time using TypeScript, Cheerio and Playwright.
 
-Under development, however mainly for personal use!
 
 ## How to setup ##
 1. Download or clone source code
@@ -125,3 +122,4 @@ A basic docker `compose.yaml` is provided. Follow these steps to configure and r
 Your account may be at risk of getting banned or suspended using this script, you've been warned!
 <br /> 
 Use this script at your own risk!
+
