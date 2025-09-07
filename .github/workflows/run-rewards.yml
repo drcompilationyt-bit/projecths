@@ -1,4 +1,4 @@
-name: Run Microsoft Rewards Script (daily random 07-10 ET with jitter)
+name: "Run Microsoft Rewards Script (daily random 07-10 ET with jitter)"
 
 on:
   schedule:
@@ -17,30 +17,27 @@ jobs:
       NODE_VERSION: '18'
 
     steps:
-      - name: Checkout repo
+      - name: "Checkout repo"
         uses: actions/checkout@v4
 
-      - name: Setup Node
+      - name: "Setup Node"
         uses: actions/setup-node@v4
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: 'npm'
 
-      - name: Decide whether this scheduled run should execute (slot selection in America/Toronto)
+      - name: "Decide whether this scheduled run should execute (slot selection in America/Toronto)"
         shell: bash
         run: |
-          # Toronto local date and hour
           LOCAL_DATE=$(TZ='America/Toronto' date +%F)
           LOCAL_HOUR=$(TZ='America/Toronto' date +%H)
           echo "Toronto local date: $LOCAL_DATE  hour: $LOCAL_HOUR"
 
-          # Deterministic slot (0..3) from the date using sha256 last hex nibble
           HASH=$(printf '%s' "$LOCAL_DATE" | sha256sum | awk '{print $1}')
           LAST_HEX=${HASH: -1}
           SLOT=$((16#$LAST_HEX % 4))
           echo "Slot for today (0..3): $SLOT"
 
-          # Map local hour to expected slot index (07->0, 08->1, 09->2, 10->3)
           case "$LOCAL_HOUR" in
             07) EXPECTED=0 ;;
             08) EXPECTED=1 ;;
@@ -57,7 +54,7 @@ jobs:
 
           echo "This job won the day's slot (Toronto time) — continuing."
 
-      - name: Winning job: compute jitter (0-59 minutes) in Toronto and sleep
+      - name: "Compute jitter and sleep (winning job)"
         shell: bash
         run: |
           LOCAL_DATE=$(TZ='America/Toronto' date +%F)
@@ -66,10 +63,10 @@ jobs:
           LAST2=${HASH2: -2}
           DEC=$((16#$LAST2))
           JITTER_MIN=$((DEC % 60))
-          echo "Sleeping for $JITTER_MIN minute(s) (Toronto local jitter) before starting work."
+          echo "Sleeping for ${JITTER_MIN} minute(s) (Toronto local jitter)"
           sleep $((JITTER_MIN * 60))
 
-      - name: Create src/accounts.json from secret
+      - name: "Create src/accounts.json from secret"
         shell: bash
         run: |
           mkdir -p src
@@ -78,60 +75,60 @@ jobs:
             exit 1
           fi
           printf '%s' "${{ secrets.ACCOUNTS_JSON }}" > src/accounts.json
-          echo "wrote src/accounts.json (not committed) - size: $(wc -c < src/accounts.json) bytes"
+          echo "wrote src/accounts.json - size: $(wc -c < src/accounts.json) bytes"
 
-      - name: Optionally create src/config.json from secret (if provided)
+      - name: "Create src/config.json from secret if provided"
         shell: bash
         run: |
           if [ -n "${{ secrets.CONFIG_JSON }}" ]; then
             printf '%s' "${{ secrets.CONFIG_JSON }}" > src/config.json
-            echo "wrote src/config.json from secret (size: $(wc -c < src/config.json) bytes)"
+            echo "wrote src/config.json - size: $(wc -c < src/config.json) bytes"
           else
-            echo "CONFIG_JSON secret not provided; using repo's config.json (if present)."
+            echo "CONFIG_JSON not provided; using repo config.json if present."
           fi
 
-      - name: Install OS packages required by browsers (Playwright)
+      - name: "Install OS packages required by browsers (Playwright)"
+        shell: bash
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y \
-            libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libxss1 \
-            libasound2 libxcomposite1 libxdamage1 libxrandr2 libgtk-3-0 libgbm1 \
-            ca-certificates fonts-liberation libappindicator3-1 libatspi2.0-0 \
-            lsb-release
+          sudo apt-get install -y libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libxss1 libasound2 libxcomposite1 libxdamage1 libxrandr2 libgtk-3-0 libgbm1 ca-certificates fonts-liberation libappindicator3-1 libatspi2.0-0 lsb-release
 
-      - name: Install Node dependencies (clean)
+      - name: "Install Node dependencies (clean)"
+        shell: bash
         run: |
           npm ci
           echo "node: $(node -v); npm: $(npm -v)"
           npm ls --depth=0 || true
 
-      - name: Verify TypeScript / build tools present (install if missing)
+      - name: "Verify TypeScript / install if missing"
         shell: bash
         run: |
           if ! npx --no-install tsc --version >/dev/null 2>&1; then
-            echo "TypeScript not found. Installing locally as devDependency..."
+            echo "TypeScript missing; installing locally..."
             npm i -D typescript@latest
-            npm ls --depth=0 || true
           else
             echo "TypeScript present."
             npx tsc --version || true
           fi
 
-      - name: Install Playwright browser(s)
+      - name: "Install Playwright browser(s)"
+        shell: bash
         run: |
           npx playwright install --with-deps chromium
 
-      - name: Build the project (per README)
-        run: npm run build
+      - name: "Build the project (per README)"
+        shell: bash
+        run: |
+          npm run build
 
-      - name: Run the built script and save logs
+      - name: "Run the built script and save logs"
         shell: bash
         run: |
           mkdir -p logs
           npm run start 2>&1 | tee logs/script.log || true
           echo "Captured logs to logs/script.log"
 
-      - name: Upload logs artifact
+      - name: "Upload logs artifact"
         uses: actions/upload-artifact@v4
         with:
           name: microsoft-rewards-logs-${{ github.run_id }}
