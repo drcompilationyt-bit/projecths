@@ -35,6 +35,7 @@ jobs:
       - name: Decide whether this scheduled run should execute (slot selection in America/Toronto)
         shell: bash
         run: |
+          set -euo pipefail
           LOCAL_DATE=$(TZ='America/Toronto' date +%F)
           LOCAL_HOUR=$(TZ='America/Toronto' date +%H)
           echo "Toronto local date: $LOCAL_DATE  hour: $LOCAL_HOUR"
@@ -93,10 +94,8 @@ jobs:
             echo "Decoding ACCOUNTS_JSON_B64 -> src/accounts.json"
             printf '%s' "${{ secrets.ACCOUNTS_JSON_B64 }}" | base64 --decode > src/accounts.json
           elif [ -n "${{ secrets.ACCOUNTS_JSON }}" ]; then
-            # fallback (less reliable): raw JSON secret
             echo "ACCOUNTS_JSON_B64 not present, using raw ACCOUNTS_JSON fallback (fragile)"
             RAW="${{ secrets.ACCOUNTS_JSON }}"
-            # strip accidental surrounding quotes
             RAW="${RAW#\"}"; RAW="${RAW%\"}"
             RAW="${RAW#\'}"; RAW="${RAW%\'}"
             printf '%s' "$RAW" > src/accounts.json
@@ -114,7 +113,7 @@ jobs:
               echo "accounts.json validated by jq as proper JSON."
             else
               echo "Invalid JSON according to jq. Please re-create the secret as base64 of valid JSON and try again."
-              sed -n '1,200p' src/accounts.json || true
+              sed -n '1,200p' src.accounts.json || true
               exit 1
             fi
           else
@@ -130,7 +129,7 @@ jobs:
             echo "Decoding CONFIG_JSON_B64 -> src/config.json"
             printf '%s' "${{ secrets.CONFIG_JSON_B64 }}" | base64 --decode > src/config.json
             echo "Wrote src/config.json (size: $(wc -c < src/config.json) bytes). Preview first 6 lines:"
-            sed -n '1,6p' src/config.json || true
+            sed -n '1,6p' src.config.json || true || true
             if command -v jq >/dev/null 2>&1; then
               jq . src/config.json >/dev/null 2>&1 || (echo "Invalid JSON in CONFIG_JSON_B64"; sed -n '1,200p' src/config.json || true; exit 1)
             else
@@ -174,6 +173,7 @@ jobs:
       - name: Install Node dependencies (clean)
         shell: bash
         run: |
+          set -euo pipefail
           npm ci
           echo "node: $(node -v); npm: $(npm -v)"
           npm ls --depth=0 || true
@@ -181,6 +181,7 @@ jobs:
       - name: Verify TypeScript / install if missing
         shell: bash
         run: |
+          set -euo pipefail
           if ! npx --no-install tsc --version >/dev/null 2>&1; then
             echo "TypeScript missing; installing locally..."
             npm i -D typescript@latest
@@ -208,6 +209,7 @@ jobs:
       - name: Optional: Run tsc --noEmit as a quick pre-check (using tsconfig.ci.json if present)
         shell: bash
         run: |
+          set -euo pipefail
           if npx --no-install tsc --version >/dev/null 2>&1; then
             if [ -f tsconfig.ci.json ]; then
               echo "Running tsc --noEmit -p tsconfig.ci.json ..."
@@ -229,6 +231,7 @@ jobs:
       - name: Install Playwright OS deps helper (optional) and browsers
         shell: bash
         run: |
+          set -euo pipefail
           if command -v npx >/dev/null 2>&1; then
             echo "Running npx playwright install-deps (may require sudo)..."
             npx playwright install-deps || true
@@ -239,6 +242,7 @@ jobs:
       - name: Build the project (per README) (use tsconfig.ci.json if present)
         shell: bash
         run: |
+          set -euo pipefail
           if [ -f tsconfig.ci.json ]; then
             echo "Compiling with tsconfig.ci.json..."
             npx tsc -p tsconfig.ci.json
@@ -250,6 +254,7 @@ jobs:
       - name: Run the built script and save logs
         shell: bash
         run: |
+          set -euo pipefail
           mkdir -p logs
           npm run start 2>&1 | tee logs/script.log || true
           echo "Captured logs to logs/script.log"
