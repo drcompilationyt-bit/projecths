@@ -131,7 +131,7 @@ jobs:
             echo "Wrote src/config.json (size: $(wc -c < src/config.json) bytes). Preview first 6 lines:"
             sed -n '1,6p' src/config.json || true
             if command -v jq >/dev/null 2>&1; then
-              jq . src/config.json >/dev/null 2>&1 || (echo "Invalid JSON in CONFIG_JSON_B64"; sed -n '1,200p' src/config.json || true; exit 1)
+              jq . src.config.json >/dev/null 2>&1 || (echo "Invalid JSON in CONFIG_JSON_B64"; sed -n '1,200p' src/config.json || true; exit 1)
             else
               node -e "try{JSON.parse(require('fs').readFileSync('src/config.json','utf8')); console.log('config json ok')}catch(e){console.error('Invalid JSON:', e.message); process.exit(2)}"
             fi
