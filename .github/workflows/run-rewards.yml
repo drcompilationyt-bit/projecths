@@ -84,7 +84,7 @@ jobs:
           set -euo pipefail
           mkdir -p src
 
-          # 1) Preferred: single-line base64 secret
+          # Preferred: single-line base64 secret
           if [ -n "${{ secrets.ACCOUNTS_JSON_B64 }}" ]; then
             printf '%s' "${{ secrets.ACCOUNTS_JSON_B64 }}" | base64 --decode > src/accounts.json \
               || { echo "ERROR: failed to decode ACCOUNTS_JSON_B64"; exit 1; }
