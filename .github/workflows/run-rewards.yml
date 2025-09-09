@@ -177,16 +177,18 @@ jobs:
         run: |
           set -euo pipefail
           if [ -f tsconfig.json ]; then
-            node -e "
-const fs=require('fs'),p='tsconfig.json';
-let cfg=JSON.parse(fs.readFileSync(p,'utf8'));
-if(!Array.isArray(cfg.exclude)) cfg.exclude=[];
-if(!cfg.exclude.includes('src/accounts.json')){
+            node <<'NODE'
+const fs = require('fs'), p = 'tsconfig.json';
+let cfg = JSON.parse(fs.readFileSync(p, 'utf8'));
+if (!Array.isArray(cfg.exclude)) cfg.exclude = [];
+if (!cfg.exclude.includes('src/accounts.json')) {
   cfg.exclude.push('src/accounts.json');
-  fs.writeFileSync(p,JSON.stringify(cfg,null,2)+'\n');
+  fs.writeFileSync(p, JSON.stringify(cfg, null, 2) + '\n');
   console.log('Added src/accounts.json to tsconfig.json exclude');
-} else console.log('tsconfig.json already excludes src/accounts.json');
-"
+} else {
+  console.log('tsconfig.json already excludes src/accounts.json');
+}
+NODE
           else
             echo "No tsconfig.json found; skipping tsconfig patch."
           fi
