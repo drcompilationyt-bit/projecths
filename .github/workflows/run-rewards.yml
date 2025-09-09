@@ -2,8 +2,7 @@ name: "Run Microsoft Rewards Script (randomized start around 08:00 Toronto, EST-
 
 on:
   schedule:
-    # 13:00 UTC == 08:00 America/Toronto when using EST (UTC-5).
-    # You asked to target EST only, so we schedule at 13 UTC.
+    # 13:00 UTC == 08:00 EST
     - cron: '0 13 * * *'
   workflow_dispatch:
     inputs:
@@ -35,159 +34,85 @@ jobs:
         run: |
           set -euo pipefail
           EVENT_NAME="${GITHUB_EVENT_NAME:-}"
-          echo "Event: $EVENT_NAME  simulate_schedule: ${SIMULATE_SCHEDULE:-}"
-
-          # Manual runs without simulate_schedule => run immediately (no hour check)
           if [ "$EVENT_NAME" = "workflow_dispatch" ] && [ "${SIMULATE_SCHEDULE:-}" != "true" ]; then
-            echo "Manual run requested and simulate_schedule != true — proceeding immediately (no hour check)."
+            echo "Manual run requested (no hour check)."
           else
-            # For scheduled runs (or simulated manual runs) check Toronto local hour MUST be 8
-            LOCAL_HOUR_RAW=$(TZ='America/Toronto' date +%H)
-            LOCAL_HOUR=${LOCAL_HOUR_RAW#0}
-            echo "Toronto local hour: $LOCAL_HOUR (raw: $LOCAL_HOUR_RAW)"
+            LOCAL_HOUR=$(TZ='America/Toronto' date +%H | sed 's/^0//')
             if [ "$LOCAL_HOUR" -ne 8 ]; then
-              echo "Local hour is not 8 (EST target) — exiting quickly to save runner time."
+              echo "Local hour is not 8 (EST target) — exiting."
               exit 0
             fi
             echo "Local hour is 8 — continuing."
           fi
 
-      - name: "Compute random jitter (0..90 minutes) and sleep — skipped for manual runs unless simulate_schedule=true"
+      - name: "Compute random jitter (0..90 minutes)"
         shell: bash
         run: |
           set -euo pipefail
-          EVENT_NAME="${GITHUB_EVENT_NAME:-}"
-          if [ "$EVENT_NAME" = "workflow_dispatch" ] && [ "${SIMULATE_SCHEDULE:-}" != "true" ]; then
-            echo "Manual immediate run — skipping jitter sleep."
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ] && [ "${SIMULATE_SCHEDULE:-}" != "true" ]; then
+            echo "Manual run — skipping jitter."
           else
-            # max jitter seconds = 90 minutes = 5400 sec
-            MAX_SEC=$((90 * 60))
-            RAND_RAW=$(od -An -N4 -tu4 /dev/urandom | tr -d ' ')
-            JITTER_SEC=$(( RAND_RAW % (MAX_SEC + 1) ))
-            echo "Sleeping for ${JITTER_SEC} second(s) (random jitter up to 90 minutes)."
-            sleep "${JITTER_SEC}"
+            JITTER_SEC=$(( $(od -An -N4 -tu4 /dev/urandom | tr -d ' ') % (90*60 + 1) ))
+            echo "Sleeping $JITTER_SEC seconds (jitter up to 90m)."
+            sleep "$JITTER_SEC"
           fi
 
-      - name: "Write src/accounts.json from secret (handles string-wrapped JSON and base64)"
+      - name: "Write src/accounts.json from secret"
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p src
-
           if [ -n "${{ secrets.ACCOUNTS_JSON_B64 }}" ]; then
-            printf '%s' "${{ secrets.ACCOUNTS_JSON_B64 }}" | base64 --decode > src/accounts.json \
-              || { echo "ERROR: failed to decode ACCOUNTS_JSON_B64"; exit 1; }
-
+            printf '%s' "${{ secrets.ACCOUNTS_JSON_B64 }}" | base64 --decode > src/accounts.json
           elif [ -n "${{ secrets.ACCOUNTS_JSON }}" ]; then
-            echo "ACCOUNTS_JSON present — attempting robust handling."
             RAW="${{ secrets.ACCOUNTS_JSON }}"
-
-            # Strip a single pair of surrounding quotes if present
             case "$RAW" in
               \"*\" ) RAW="${RAW#\"}"; RAW="${RAW%\"}" ;;
               \'*\' ) RAW="${RAW#\'}"; RAW="${RAW%\'}" ;;
             esac
-
-            # If it already looks like JSON (starts with { or [), accept it
             case "$RAW" in
-              [\{[]* )
-                printf '%s' "$RAW" > src/accounts.json
-                ;;
+              [\{[]* ) printf '%s' "$RAW" > src/accounts.json ;;
               * )
-                TMP_DEC="$(mktemp)"
-                if printf '%s' "$RAW" | grep -Eq '^[A-Za-z0-9+/=]+$' && printf '%s' "$RAW" | base64 --decode > "$TMP_DEC" 2>/dev/null; then
-                  if command -v jq >/dev/null 2>&1; then
-                    if jq . "$TMP_DEC" >/dev/null 2>&1; then
-                      mv "$TMP_DEC" src/accounts.json
-                    else
-                      rm -f "$TMP_DEC"
-                      echo "ERROR: ACCOUNTS_JSON appears base64 but decoded content is not valid JSON."
-                      exit 1
-                    fi
-                  else
-                    if node -e "try{JSON.parse(require('fs').readFileSync('$TMP_DEC','utf8')); process.exit(0)}catch(e){ process.exit(2) }"; then
-                      mv "$TMP_DEC" src/accounts.json
-                    else
-                      rm -f "$TMP_DEC"
-                      echo "ERROR: ACCOUNTS_JSON appears base64 but decoded content is not valid JSON (node fallback)."
-                      exit 1
-                    fi
-                  fi
+                TMP=$(mktemp)
+                if printf '%s' "$RAW" | base64 --decode > "$TMP" 2>/dev/null; then
+                  mv "$TMP" src/accounts.json
                 else
-                  rm -f "$TMP_DEC" 2>/dev/null || true
-                  echo "ERROR: ACCOUNTS_JSON does not look like raw JSON and is not valid base64 → cannot interpret."
-                  exit 1
-                fi
-                ;;
+                  echo "ERROR: Invalid ACCOUNTS_JSON"; exit 1
+                fi ;;
             esac
-
           else
-            echo "ERROR: No ACCOUNTS_JSON_B64 or ACCOUNTS_JSON secret found. Set one of them."
-            exit 1
+            echo "No ACCOUNTS_JSON secret found"; exit 1
           fi
-
-          # Safe metadata only
-          echo "Wrote src/accounts.json (size: $(wc -c < src/accounts.json) bytes)."
-
-          # Validate JSON without printing content
           if command -v jq >/dev/null 2>&1; then
-            jq . src.accounts.json >/dev/null 2>&1 || { echo "ERROR: src.accounts.json invalid JSON according to jq"; exit 1; }
-            echo "accounts.json validated by jq."
+            jq . src/accounts.json >/dev/null || { echo "Invalid JSON"; exit 1; }
           else
-            node -e "try{JSON.parse(require('fs').readFileSync('src/accounts.json','utf8')); console.log('accounts.json validated by node')}catch(e){ console.error('Invalid JSON:', e.message); process.exit(2) }"
+            node -e "JSON.parse(require('fs').readFileSync('src/accounts.json','utf8'))" || exit 1
           fi
 
-      - name: "Install Node dependencies (npm i)"
-        shell: bash
-        run: |
-          set -euo pipefail
-          npm i --no-audit --no-fund
-          echo "node: $(node -v); npm: $(npm -v)"
+      - name: "Install Node dependencies"
+        run: npm i --no-audit --no-fund
 
-      - name: "Build the project (npm run build)"
-        shell: bash
-        run: |
-          set -euo pipefail
-          npm run build
+      - name: "Build the project"
+        run: npm run build
 
       - name: "Run the built script and save logs"
-        shell: bash
         run: |
-          set -euo pipefail
           mkdir -p logs
           npm run start 2>&1 | tee logs/script.log || true
-          echo "Captured logs to logs/script.log"
 
-      - name: "Sanitize logs/script.log (redact emails/passwords/tokens/base64-like strings and gmail addresses)"
-        shell: bash
+      - name: "Sanitize logs"
         run: |
-          set -euo pipefail
           cp logs/script.log logs/script.log.raw || true
-
-          # 1) redact JSON password fields like "password": "value"
           sed -E -i 's/("password"[[:space:]]*:[[:space:]]*)"[^"]*"/\1"***REDACTED***"/Ig' logs/script.log
-
-          # 2) redact common password patterns like password: value or password= value
           sed -E -i 's/([Pp]ass(word)?[[:space:]]*[:=][[:space:]]*)[^[:space:],;]+/\1***REDACTED***/g' logs/script.log
-
-          # 3) redact any word that contains @gmail.com (user request)
           sed -E -i 's/[^[:space:]]*@gmail\.com/***REDACTED_GMAIL***/g' logs/script.log
-
-          # 4) redact other email addresses (general)
           sed -E -i 's/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/***REDACTED_EMAIL***/g' logs/script.log
-
-          # 5) redact Authorization headers / bearer/basic tokens
-          sed -E -i 's/([Aa]uthorization[[:space:]]*[:=][[:space:]]*(Bearer|Basic)?[[:space:]]*)[^[:space:]]+/\1***REDACTED***/g' logs.script.log
-
-          # 6) redact long base64-like strings (heuristic for API keys / tokens)
-          sed -E -i 's/[A-Za-z0-9+/]{40,}={0,2}/***REDACTED_BASE64***/g' logs.script.log
-
-          # 7) fallback: remove any occurrences of the literal word "see" following "password" patterns (your placeholder)
+          sed -E -i 's/([Aa]uthorization[[:space:]]*[:=][[:space:]]*(Bearer|Basic)?[[:space:]]*)[^[:space:]]+/\1***REDACTED***/g' logs/script.log
+          sed -E -i 's/[A-Za-z0-9+/]{40,}={0,2}/***REDACTED_BASE64***/g' logs/script.log
           sed -E -i 's/("password"[[:space:]]*:[[:space:]]*)"see"/\1"***REDACTED***"/Ig' logs/script.log
-
           rm -f logs/script.log.raw || true
 
-      - name: "Upload sanitized logs artifact"
+      - name: "Upload logs"
         if: always()
         uses: actions/upload-artifact@v4
         with:
