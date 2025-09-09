@@ -184,7 +184,7 @@ jobs:
           else
             echo "jq missing; cannot create tsconfig.ci.json. Continuing without it."
           fi
-      - name: Optional: Run tsc --noEmit as a quick pre-check (using tsconfig.ci.json if present)
+      - name: "Optional: Run tsc --noEmit as a quick pre-check (using tsconfig.ci.json if present)"
         shell: bash
         run: |
           set -euo pipefail
