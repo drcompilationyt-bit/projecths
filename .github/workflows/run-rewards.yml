@@ -29,7 +29,6 @@ jobs:
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: 'npm'
-          # ensure cache invalidates when lockfile changes
           cache-dependency-path: package-lock.json
 
       - name: "Decide whether this scheduled run should continue (EST-only target: local 08:00)"
@@ -74,11 +73,11 @@ jobs:
               \'*\' ) RAW="${RAW#\'}"; RAW="${RAW%\'}" ;;
             esac
             case "$RAW" in
-              [\{[]* ) printf '%s' "$RAW" > src/accounts.json ;;
+              [\{[]* ) printf '%s' "$RAW" > src.accounts.json ;;
               * )
                 TMP=$(mktemp)
                 if printf '%s' "$RAW" | base64 --decode > "$TMP" 2>/dev/null; then
-                  mv "$TMP" src/accounts.json
+                  mv "$TMP" src.accounts.json
                 else
                   echo "ERROR: Invalid ACCOUNTS_JSON"; exit 1
                 fi ;;
@@ -92,8 +91,23 @@ jobs:
             node -e "JSON.parse(require('fs').readFileSync('src/accounts.json','utf8'))" || exit 1
           fi
 
-      - name: "Install Node dependencies"
+      - name: "Install Node dependencies (npm ci)"
         run: npm ci --no-audit --no-fund
+
+      - name: "Cache Playwright browser binaries"
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-browser-cache-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+          restore-keys: |
+            playwright-browser-cache-${{ runner.os }}-
+
+      - name: "Install Playwright Chromium + OS dependencies"
+        shell: bash
+        run: |
+          set -euo pipefail
+          # ensure using local npx and node from setup-node
+          npx --yes playwright install --with-deps chromium
 
       - name: "Build the project"
         run: npm run build
@@ -101,12 +115,9 @@ jobs:
       - name: "Create runtime File polyfill (fallback for older Node runtimes)"
         shell: bash
         run: |
-          # Create dist dir in case build removed it or it's missing for some reason.
           mkdir -p dist
           cat > dist/polyfill-file.js <<'EOF'
           // Minimal runtime polyfill: define global File if absent.
-          // This will be preloaded via `node -r` so that modules like undici
-          // see File available on globalThis.
           if (typeof globalThis.File === 'undefined') {
             globalThis.File = class File extends Blob {
               constructor(parts = [], name = '', options = {}) {
@@ -124,8 +135,6 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p logs
-          # Preload our polyfill so undici (and other libs) see File on globalThis.
-          # Use node -r to require dist/polyfill-file.js before your bundle.
           node -r ./dist/polyfill-file.js ./dist/index.js 2>&1 | tee logs/script.log || true
           echo "Captured logs to logs/script.log"
 
@@ -134,11 +143,11 @@ jobs:
         run: |
           set -euo pipefail
           cp logs/script.log logs/script.log.raw || true
-          sed -E -i 's/("password"[[:space:]]*:[[:space:]]*)"[^"]*"/\1"***REDACTED***"/Ig' logs/script.log
-          sed -E -i 's/([Pp]ass(word)?[[:space:]]*[:=][[:space:]]*)[^[:space:],;]+/\1***REDACTED***/g' logs/script.log
-          sed -E -i 's/[^[:space:]]*@gmail\.com/***REDACTED_GMAIL***/g' logs/script.log
-          sed -E -i 's/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/***REDACTED_EMAIL***/g' logs/script.log
-          sed -E -i 's/([Aa]uthorization[[:space:]]*[:=][[:space:]]*(Bearer|Basic)?[[:space:]]*)[^[:space:]]+/\1***REDACTED***/g' logs/script.log
+          sed -E -i 's/("password"[[:space:]]*:[[:space:]]*)"[^"]*"/\1"***REDACTED***"/Ig' logs.script.log
+          sed -E -i 's/([Pp]ass(word)?[[:space:]]*[:=][[:space:]]*)[^[:space:],;]+/\1***REDACTED***/g' logs.script.log
+          sed -E -i 's/[^[:space:]]*@gmail\.com/***REDACTED_GMAIL***/g' logs.script.log
+          sed -E -i 's/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/***REDACTED_EMAIL***/g' logs.script.log
+          sed -E -i 's/([Aa]uthorization[[:space:]]*[:=][[:space:]]*(Bearer|Basic)?[[:space:]]*)[^[:space:]]+/\1***REDACTED***/g' logs.script.log
           sed -E -i 's/[A-Za-z0-9+/]{40,}={0,2}/***REDACTED_BASE64***/g' logs.script.log
           sed -E -i 's/("password"[[:space:]]*:[[:space:]]*)"see"/\1"***REDACTED***"/Ig' logs.script.log
           rm -f logs/script.log.raw || true
