@@ -133,7 +133,8 @@ jobs:
           echo "Updating apt..."
           sudo apt-get update -y
 
-          BASE_PKGS="libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libxss1 libxcomposite1 libxdamage1 libxrandr2 libgtk-3-0 libgbm1 ca-certificates fonts-liberation libappindicator3-1 libatspi2.0-0 lsb-release"
+          # base list (added jq for config editing)
+          BASE_PKGS="libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libxss1 libxcomposite1 libxdamage1 libxrandr2 libgtk-3-0 libgbm1 ca-certificates fonts-liberation libappindicator3-1 libatspi2.0-0 lsb-release jq"
 
           echo "Attempting to install system packages (with libasound2 fallback logic)..."
           if sudo apt-get install -y $BASE_PKGS libasound2; then
@@ -172,37 +173,43 @@ jobs:
             npx tsc --version || true
           fi
 
-      - name: "Ensure tsconfig excludes runtime-only JSON files (src/accounts.json)"
+      - name: "Create tsconfig.ci.json (exclude src/accounts.json) for CI"
         shell: bash
         run: |
           set -euo pipefail
-          if [ -f tsconfig.json ]; then
-            node <<'NODE'
-const fs = require('fs'), p = 'tsconfig.json';
-let cfg = JSON.parse(fs.readFileSync(p, 'utf8'));
-if (!Array.isArray(cfg.exclude)) cfg.exclude = [];
-if (!cfg.exclude.includes('src/accounts.json')) {
-  cfg.exclude.push('src/accounts.json');
-  fs.writeFileSync(p, JSON.stringify(cfg, null, 2) + '\n');
-  console.log('Added src/accounts.json to tsconfig.json exclude');
-} else {
-  console.log('tsconfig.json already excludes src/accounts.json');
-}
-NODE
+          if [ -f tsconfig.json ] && command -v jq >/dev/null 2>&1; then
+            # Create a CI copy that ensures src/accounts.json is excluded (no in-place edits)
+            jq '(.exclude //= []) | .exclude |= (.+["src/accounts.json"] | unique)' tsconfig.json > tsconfig.ci.json
+            echo "Wrote tsconfig.ci.json (tsconfig.json copy with src/accounts.json excluded)"
+            echo "tsconfig.ci.json preview (first 80 chars):"
+            head -c 320 tsconfig.ci.json || true
           else
-            echo "No tsconfig.json found; skipping tsconfig patch."
+            if [ ! -f tsconfig.json ]; then
+              echo "No tsconfig.json found; skipping tsconfig.ci.json creation."
+            else
+              echo "jq missing; cannot create tsconfig.ci.json. Continuing without it."
+            fi
           fi
 
-      - name: "Optional: Run tsc --noEmit as a quick pre-check"
+      - name: "Optional: Run tsc --noEmit as a quick pre-check (using tsconfig.ci.json if present)"
         shell: bash
         run: |
           if npx --no-install tsc --version >/dev/null 2>&1; then
-            echo "Running tsc --noEmit to check compilation (excludes should be in effect)..."
-            npx tsc --noEmit || { echo "tsc failed; see output"; exit 1; }
+            if [ -f tsconfig.ci.json ]; then
+              echo "Running tsc --noEmit -p tsconfig.ci.json to check compilation..."
+              npx tsc --noEmit -p tsconfig.ci.json || { echo "tsc (ci) failed; see output"; exit 1; }
+            else
+              echo "Running tsc --noEmit (tsconfig.ci.json not present)..."
+              npx tsc --noEmit || { echo "tsc failed; see output"; exit 1; }
+            fi
           else
             echo "TypeScript not installed yet; installing temporarily for check..."
             npm i -D typescript@latest
-            npx tsc --noEmit || { echo "tsc failed; see output"; exit 1; }
+            if [ -f tsconfig.ci.json ]; then
+              npx tsc --noEmit -p tsconfig.ci.json || { echo "tsc (ci) failed; see output"; exit 1; }
+            else
+              npx tsc --noEmit || { echo "tsc failed; see output"; exit 1; }
+            fi
           fi
 
       - name: "Install Playwright OS deps helper (optional) and browsers"
@@ -216,10 +223,16 @@ NODE
           echo "Installing Playwright Chromium (with deps)..."
           npx playwright install --with-deps chromium
 
-      - name: "Build the project (per README)"
+      - name: "Build the project (per README) (use tsconfig.ci.json if present)"
         shell: bash
         run: |
-          npm run build
+          if [ -f tsconfig.ci.json ]; then
+            echo "Compiling with tsconfig.ci.json..."
+            npx tsc -p tsconfig.ci.json
+          else
+            echo "No tsconfig.ci.json — running npm run build (default behaviour)..."
+            npm run build
+          fi
 
       - name: "Run the built script and save logs"
         shell: bash
