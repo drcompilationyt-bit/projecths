@@ -20,7 +20,6 @@ jobs:
     timeout-minutes: 360
     env:
       NODE_VERSION: '18'
-      # propagate the workflow_dispatch input into an env var for steps to read
       SIMULATE_SCHEDULE: ${{ github.event.inputs.simulate_schedule || 'false' }}
 
     steps:
@@ -67,7 +66,6 @@ jobs:
           SIMULATE_SCHEDULE: ${{ env.SIMULATE_SCHEDULE }}
         run: |
           set -euo pipefail
-          # GITHUB_EVENT_NAME is provided by Actions runner
           EVENT_NAME="${GITHUB_EVENT_NAME:-}"
           echo "Event name: $EVENT_NAME  simulate_schedule: ${SIMULATE_SCHEDULE:-}"
 
@@ -84,7 +82,7 @@ jobs:
             sleep $((JITTER_MIN * 60))
           fi
 
-      - name: "Write & validate src/accounts.json (supports base64 or raw secret)"
+      - name: "Write & robustly validate/repair src/accounts.json (supports base64 or raw secret)"
         shell: bash
         run: |
           set -euo pipefail
@@ -105,13 +103,118 @@ jobs:
           fi
 
           echo "wrote src/accounts.json - size: $(wc -c < src/accounts.json) bytes"
-          echo "First 3 lines for quick sanity (non-sensitive):"
-          sed -n '1,3p' src/accounts.json || true
+          echo "Preview (first 10 lines):"
+          sed -n '1,10p' src/accounts.json || true
 
+          # Validate via jq first (fast, strict)
           if command -v jq >/dev/null 2>&1; then
-            jq . src/accounts.json >/dev/null || { echo "Invalid JSON in src/accounts.json (jq parse failed)"; sed -n '1,200p' src/accounts.json; exit 1; }
+            if jq . src/accounts.json >/dev/null 2>&1; then
+              echo "accounts.json validated by jq as proper JSON."
+            else
+              echo "jq parse failed — attempting Node-based repair (see warnings below)."
+              # Create repair script and run it
+              cat > /tmp/repair_accounts.js <<'JS'
+/*
+ Repair attempts for malformed accounts file:
+ 1) If it's valid JSON — do nothing.
+ 2) Try eval-like parse as JS object literal with vm.runInNewContext('(' + s + ')').
+ 3) If still fails, run heuristic cleanups:
+    - remove lines that are only '*' or '***'
+    - quote unquoted keys like: key: value  -> "key": value
+    - wrap simple unquoted values in quotes when safe
+    - remove trailing commas
+*/
+const fs = require('fs'), vm = require('vm');
+const p = 'src/accounts.json';
+let s = fs.readFileSync(p, 'utf8');
+
+function tryJSONParse(str){
+  try { return {ok:true, val: JSON.parse(str)}; } catch(e) { return {ok:false, err:e}; }
+}
+
+let r = tryJSONParse(s);
+if (r.ok) {
+  console.log('Already valid JSON — no repair needed.');
+  process.exit(0);
+}
+console.log('Initial JSON parse failed:', r.err && r.err.message ? r.err.message : String(r.err));
+
+// Attempt 1: parse as JS object literal safely via vm
+try {
+  const obj = vm.runInNewContext('(' + s + ')', {}, {timeout:1000});
+  fs.writeFileSync(p, JSON.stringify(obj, null, 2) + '\n');
+  console.log('Parsed input as JS object literal and converted to JSON.');
+  process.exit(0);
+} catch(e) {
+  console.log('JS object literal parse failed:', e && e.message ? e.message : String(e));
+}
+
+// Attempt 2: heuristic cleanup
+let t = s;
+
+// remove lines that are just sequences of stars or lines starting with '***' or lines that are only '***'
+t = t.replace(/^\s*\*+\s*$/mg, '');       // remove lines that are only stars
+t = t.replace(/^\s*\*{3,}.*$/mg, '');     // remove lines starting with ***
+t = t.replace(/^\s*\*\s*/mg, '');         // remove leading single star markers
+
+// quote unquoted object keys:  key:  -> "key":
+t = t.replace(/([{,]\s*)([A-Za-z0-9_@.-]+)\s*:/g, '$1"$2":');
+
+// wrap simple unquoted values (emails, words, numbers already handled) in quotes when they are unquoted non-JSON tokens
+t = t.replace(/:\s*([A-Za-z0-9_\-@.\/]+)\s*(,?)(\n|$)/g, ': "$1"$2$3');
+
+// remove trailing commas before closing } or ]
+t = t.replace(/,(\s*[}\]])/g, '$1');
+
+// attempt parse after heuristics
+let r2 = tryJSONParse(t);
+if (r2.ok) {
+  fs.writeFileSync(p, JSON.stringify(r2.val, null, 2) + '\n');
+  console.log('Heuristic repairs succeeded and file overwritten with JSON.');
+  process.exit(0);
+}
+
+console.error('All repair attempts failed. Showing diagnostics:');
+console.error('--- first 400 chars of original ---');
+console.error(s.slice(0,400));
+console.error('--- first 400 chars of attempted transformed ---');
+console.error(t.slice(0,400));
+process.exit(2);
+JS
+              node /tmp/repair_accounts.js || { echo "Node repair failed — please correct the secret to valid JSON and re-run."; echo "Final preview of src/accounts.json (first 200 chars):"; head -c 200 src/accounts.json || true; exit 1; }
+              echo "After repair, preview (first 10 lines):"
+              sed -n '1,10p' src/accounts.json || true
+            fi
           else
-            node -e "try{JSON.parse(require('fs').readFileSync('src/accounts.json','utf8')); console.log('json ok')}catch(e){console.error('invalid json:', e.message); process.exit(2)}"
+            # No jq present: fallback to node parse (same repair script)
+            echo "jq not found — attempting Node parse/repair (may be slower)."
+            cat > /tmp/repair_accounts.js <<'JS'
+const fs = require('fs'), vm = require('vm');
+const p = 'src/accounts.json';
+let s = fs.readFileSync(p, 'utf8');
+function tryJSONParse(str){ try { return {ok:true, val: JSON.parse(str)}; } catch(e) { return {ok:false, err:e}; } }
+let r = tryJSONParse(s);
+if (r.ok) { console.log('Already valid JSON — no repair needed.'); process.exit(0); }
+try {
+  const obj = vm.runInNewContext('(' + s + ')', {}, {timeout:1000});
+  fs.writeFileSync(p, JSON.stringify(obj, null, 2) + '\n');
+  console.log('Parsed input as JS object literal and converted to JSON.');
+  process.exit(0);
+} catch(e) {}
+let t = s;
+t = t.replace(/^\s*\*+\s*$/mg, '');
+t = t.replace(/^\s*\*{3,}.*$/mg, '');
+t = t.replace(/^\s*\*\s*/mg, '');
+t = t.replace(/([{,]\s*)([A-Za-z0-9_@.-]+)\s*:/g, '$1"$2":');
+t = t.replace(/:\s*([A-Za-z0-9_\-@.\/]+)\s*(,?)(\n|$)/g, ': "$1"$2$3');
+t = t.replace(/,(\s*[}\]])/g, '$1');
+let r2 = tryJSONParse(t);
+if (r2.ok) { fs.writeFileSync(p, JSON.stringify(r2.val, null, 2) + '\n'); console.log('Heuristic repairs succeeded and file overwritten with JSON.'); process.exit(0); }
+console.error('All repair attempts failed.'); console.error(s.slice(0,400)); process.exit(2);
+JS
+            node /tmp/repair_accounts.js || { echo "Node repair failed — please correct the secret to valid JSON and re-run."; head -c 200 src/accounts.json || true; exit 1; }
+            echo "After repair, preview (first 10 lines):"
+            sed -n '1,10p' src/accounts.json || true
           fi
 
       - name: "Write & validate src/config.json if provided (supports base64 or raw secret)"
@@ -147,13 +250,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           echo "Updating apt..."
           sudo apt-get update -y
-
-          # base list (added jq for config editing)
           BASE_PKGS="libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libxss1 libxcomposite1 libxdamage1 libxrandr2 libgtk-3-0 libgbm1 ca-certificates fonts-liberation libappindicator3-1 libatspi2.0-0 lsb-release jq"
-
           echo "Attempting to install system packages (with libasound2 fallback logic)..."
           if sudo apt-get install -y $BASE_PKGS libasound2; then
             echo "Installed with libasound2"
@@ -196,10 +295,8 @@ jobs:
         run: |
           set -euo pipefail
           if [ -f tsconfig.json ] && command -v jq >/dev/null 2>&1; then
-            # Create a CI copy that ensures src/accounts.json is excluded (no in-place edits)
             jq '(.exclude //= []) | .exclude |= (.+["src/accounts.json"] | unique)' tsconfig.json > tsconfig.ci.json
             echo "Wrote tsconfig.ci.json (tsconfig.json copy with src/accounts.json excluded)"
-            echo "tsconfig.ci.json preview (first 320 chars):"
             head -c 320 tsconfig.ci.json || true
           else
             if [ ! -f tsconfig.json ]; then
@@ -237,7 +334,6 @@ jobs:
             echo "Running npx playwright install-deps (may require sudo)..."
             npx playwright install-deps || true
           fi
-
           echo "Installing Playwright Chromium (with deps)..."
           npx playwright install --with-deps chromium
 
