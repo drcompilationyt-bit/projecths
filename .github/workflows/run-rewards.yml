@@ -84,7 +84,7 @@ jobs:
           set -euo pipefail
           mkdir -p src
 
-          # 1) Preferred: single-line base64 secret
+          # Preferred: single-line base64 secret
           if [ -n "${{ secrets.ACCOUNTS_JSON_B64 }}" ]; then
             printf '%s' "${{ secrets.ACCOUNTS_JSON_B64 }}" | base64 --decode > src/accounts.json \
               || { echo "ERROR: failed to decode ACCOUNTS_JSON_B64"; exit 1; }
@@ -93,7 +93,7 @@ jobs:
             echo "ACCOUNTS_JSON present — attempting robust handling."
             RAW="${{ secrets.ACCOUNTS_JSON }}"
 
-            # Strip a single pair of surrounding quotes if present (unescape literal string case)
+            # Strip a single pair of surrounding quotes if present (unescape literal-string case)
             case "$RAW" in
               \"*\" ) RAW="${RAW#\"}"; RAW="${RAW%\"}" ;;
               \'*\' ) RAW="${RAW#\'}"; RAW="${RAW%\'}" ;;
@@ -140,153 +140,69 @@ jobs:
             exit 1
           fi
 
-          # Small safe preview and validation
-          echo "Wrote src/accounts.json (size: $(wc -c < src/accounts.json) bytes). Preview (first 120 bytes):"
-          head -c 120 src/accounts.json || true
-          echo
+          # Report only safe metadata (no content preview)
+          echo "Wrote src/accounts.json (size: $(wc -c < src.accounts.json) bytes)."
 
+          # Validate JSON without printing content
           if command -v jq >/dev/null 2>&1; then
-            jq . src/accounts.json >/dev/null 2>&1 || { echo "ERROR: src/accounts.json invalid JSON according to jq"; exit 1; }
+            jq . src.accounts.json >/dev/null 2>&1 || { echo "ERROR: src.accounts.json invalid JSON according to jq"; exit 1; }
             echo "accounts.json validated by jq."
           else
             node -e "try{JSON.parse(require('fs').readFileSync('src/accounts.json','utf8')); console.log('accounts.json validated by node')}catch(e){ console.error('Invalid JSON:', e.message); process.exit(2) }"
           fi
 
-      - name: "Write src/config.json from base64 secret and validate (optional)"
+      - name: "Install Node dependencies (npm i)"
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p src
-          if [ -n "${{ secrets.CONFIG_JSON_B64 }}" ]; then
-            echo "Decoding CONFIG_JSON_B64 -> src/config.json"
-            printf '%s' "${{ secrets.CONFIG_JSON_B64 }}" | base64 --decode > src/config.json
-            echo "Wrote src/config.json (size: $(wc -c < src/config.json) bytes). Preview first 6 lines:"
-            sed -n '1,6p' src/config.json || true
-            if command -v jq >/dev/null 2>&1; then
-              jq . src/config.json >/dev/null 2>&1 || (echo "Invalid JSON in CONFIG_JSON_B64"; sed -n '1,200p' src/config.json || true; exit 1)
-            else
-              node -e "try{JSON.parse(require('fs').readFileSync('src/config.json','utf8')); console.log('config json ok')}catch(e){console.error('Invalid JSON:', e.message); process.exit(2)}"
-            fi
-          elif [ -n "${{ secrets.CONFIG_JSON }}" ]; then
-            echo "Using raw CONFIG_JSON fallback (fragile)"
-            RAW="${{ secrets.CONFIG_JSON }}"
-            RAW="${RAW#\"}"; RAW="${RAW%\"}"
-            RAW="${RAW#\'}"; RAW="${RAW%\'}"
-            printf '%s' "$RAW" > src/config.json
-            echo "Wrote src/config.json (size: $(wc -c < src/config.json) bytes)."
-          else
-            echo "No CONFIG_JSON provided; using repo config.json if present."
-          fi
-
-      - name: "Install OS packages required by browsers (Playwright) (robust)"
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo "Updating apt..."
-          sudo apt-get update -y
-          BASE_PKGS="libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libxss1 libxcomposite1 libxdamage1 libxrandr2 libgtk-3-0 libgbm1 ca-certificates fonts-liberation libappindicator3-1 libatspi2.0-0 lsb-release jq"
-          echo "Installing system packages (with libasound2 fallback logic)..."
-          if sudo apt-get install -y $BASE_PKGS libasound2; then
-            echo "Installed with libasound2"
-          elif sudo apt-get install -y $BASE_PKGS libasound2t64; then
-            echo "Installed with libasound2t64"
-          elif sudo apt-get install -y $BASE_PKGS liboss4-salsa-asound2; then
-            echo "Installed with liboss4-salsa-asound2"
-          else
-            echo "Failed to install any libasound provider; printing apt-cache policy for debugging"
-            apt-cache policy libasound2 libasound2t64 liboss4-salsa-asound2 || true
-            exit 1
-          fi
-
-      - name: "Install Node dependencies (clean)"
-        shell: bash
-        run: |
-          set -euo pipefail
-          npm ci
+          # Install packages using npm i (as requested)
+          npm i
           echo "node: $(node -v); npm: $(npm -v)"
-          npm ls --depth=0 || true
 
-      - name: "Verify TypeScript / install if missing"
+      - name: "Build the project (npm run build)"
         shell: bash
         run: |
           set -euo pipefail
-          if ! npx --no-install tsc --version >/dev/null 2>&1; then
-            echo "TypeScript missing; installing locally..."
-            npm i -D typescript@latest
-          else
-            echo "TypeScript present."
-            npx tsc --version || true
-          fi
-
-      - name: "Create tsconfig.ci.json (exclude src/accounts.json) for CI"
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [ -f tsconfig.json ] && command -v jq >/dev/null 2>&1; then
-            jq '(.exclude //= []) | .exclude |= (.+["src/accounts.json"] | unique)' tsconfig.json > tsconfig.ci.json
-            echo "Wrote tsconfig.ci.json (tsconfig.json copy with src/accounts.json excluded)."
-            head -c 320 tsconfig.ci.json || true
-          elif [ ! -f tsconfig.json ]; then
-            echo "No tsconfig.json found; skipping tsconfig.ci.json creation."
-          else
-            echo "jq missing; cannot create tsconfig.ci.json. Continuing without it."
-          fi
-
-      - name: "Optional: Run tsc --noEmit as a quick pre-check (using tsconfig.ci.json if present)"
-        shell: bash
-        run: |
-          set -euo pipefail
-          if npx --no-install tsc --version >/dev/null 2>&1; then
-            if [ -f tsconfig.ci.json ]; then
-              echo "Running tsc --noEmit -p tsconfig.ci.json ..."
-              npx tsc --noEmit -p tsconfig.ci.json || { echo "tsc (ci) failed; see output"; exit 1; }
-            else
-              echo "Running tsc --noEmit ..."
-              npx tsc --noEmit || { echo "tsc failed; see output"; exit 1; }
-            fi
-          else
-            echo "TypeScript not installed; installing temporarily..."
-            npm i -D typescript@latest
-            if [ -f tsconfig.ci.json ]; then
-              npx tsc --noEmit -p tsconfig.ci.json || { echo "tsc (ci) failed; see output"; exit 1; }
-            else
-              npx tsc --noEmit || { echo "tsc failed; see output"; exit 1; }
-            fi
-          fi
-
-      - name: "Install Playwright OS deps helper (optional) and browsers"
-        shell: bash
-        run: |
-          set -euo pipefail
-          if command -v npx >/dev/null 2>&1; then
-            echo "Running npx playwright install-deps (may require sudo)..."
-            npx playwright install-deps || true
-          fi
-          echo "Installing Playwright Chromium (with deps)..."
-          npx playwright install --with-deps chromium
-
-      - name: "Build the project (per README) (use tsconfig.ci.json if present)"
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [ -f tsconfig.ci.json ]; then
-            echo "Compiling with tsconfig.ci.json..."
-            npx tsc -p tsconfig.ci.json
-          else
-            echo "No tsconfig.ci.json — running npm run build (default behaviour)..."
-            npm run build
-          fi
+          npm run build
 
       - name: "Run the built script and save logs"
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p logs
-          # run script and capture output; don't fail the job on script exit (the log will be available)
+          # Run the script and capture output to logs/script.log (do not print secrets)
           npm run start 2>&1 | tee logs/script.log || true
           echo "Captured logs to logs/script.log"
 
-      - name: "Upload logs artifact"
+      - name: "Sanitize logs/script.log (redact emails/passwords/tokens/base64-like strings)"
+        shell: bash
+        run: |
+          set -euo pipefail
+          # operate on a copy to be safe
+          cp logs/script.log logs/script.log.raw || true
+
+          # 1) redact JSON password fields like "password": "value"
+          sed -E -i 's/("password"[[:space:]]*:[[:space:]]*)"[^"]*"/\1"***REDACTED***"/Ig' logs/script.log
+
+          # 2) redact common password patterns like password: value or password= value
+          sed -E -i 's/([Pp]ass(word)?[[:space:]]*[:=][[:space:]]*)[^[:space:],;]+/\1***REDACTED***/g' logs/script.log
+
+          # 3) redact email addresses
+          sed -E -i 's/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/***REDACTED_EMAIL***/g' logs/script.log
+
+          # 4) redact Authorization headers / bearer/basic tokens
+          sed -E -i 's/([Aa]uthorization[[:space:]]*[:=][[:space:]]*(Bearer|Basic)?[[:space:]]*)[^[:space:]]+/\1***REDACTED***/g' logs/script.log
+
+          # 5) redact long base64-like strings (heuristic for API keys / tokens)
+          sed -E -i 's/[A-Za-z0-9+/]{40,}={0,2}/***REDACTED_BASE64***/g' logs/script.log
+
+          # 6) fallback: remove any occurrences of the literal word "see" following "password" patterns (your placeholder)
+          sed -E -i 's/("password"[[:space:]]*:[[:space:]]*)"see"/\1"***REDACTED***"/Ig' logs/script.log
+
+          # Keep the raw backup out of artifacts by removing it
+          rm -f logs/script.log.raw || true
+
+      - name: "Upload sanitized logs artifact"
         if: always()
         uses: actions/upload-artifact@v4
         with:
