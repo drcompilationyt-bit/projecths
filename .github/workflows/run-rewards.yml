@@ -39,12 +39,10 @@ jobs:
           LOCAL_DATE=$(TZ='America/Toronto' date +%F)
           LOCAL_HOUR=$(TZ='America/Toronto' date +%H)
           echo "Toronto local date: $LOCAL_DATE  hour: $LOCAL_HOUR"
-
           HASH=$(printf '%s' "$LOCAL_DATE" | sha256sum | awk '{print $1}')
           LAST_HEX=${HASH: -1}
           SLOT=$((16#$LAST_HEX % 4))
           echo "Slot for today (0..3): $SLOT"
-
           case "$LOCAL_HOUR" in
             07) EXPECTED=0 ;;
             08) EXPECTED=1 ;;
@@ -52,15 +50,12 @@ jobs:
             10) EXPECTED=3 ;;
             *) echo "Local hour $LOCAL_HOUR not in 07-10 ET; exiting quickly."; exit 0 ;;
           esac
-
           echo "Expected slot for this hour: $EXPECTED"
           if [ "$SLOT" -ne "$EXPECTED" ]; then
             echo "Not this hour's chosen run — exiting quickly to save runner time."
             exit 0
           fi
-
           echo "This job won the day's slot (Toronto time) — continuing."
-
       - name: Compute jitter and sleep (winning job) — skip for manual runs unless simulate_schedule=true
         shell: bash
         env:
@@ -69,7 +64,6 @@ jobs:
           set -euo pipefail
           EVENT_NAME="${GITHUB_EVENT_NAME:-}"
           echo "Event name: $EVENT_NAME  simulate_schedule: ${SIMULATE_SCHEDULE:-}"
-
           if [ "$EVENT_NAME" = "workflow_dispatch" ] && [ "${SIMULATE_SCHEDULE:-}" != "true" ]; then
             echo "Manual run detected and simulate_schedule != true — skipping jitter sleep."
           else
@@ -82,13 +76,11 @@ jobs:
             echo "Sleeping for ${JITTER_MIN} minute(s) (Toronto local jitter)"
             sleep $((JITTER_MIN * 60))
           fi
-
       - name: Write src/accounts.json from base64 secret and validate (safe)
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p src
-
           # Prefer ACCOUNTS_JSON_B64 (base64 of the JSON with no line wraps).
           if [ -n "${{ secrets.ACCOUNTS_JSON_B64 }}" ]; then
             echo "Decoding ACCOUNTS_JSON_B64 -> src/accounts.json"
@@ -103,10 +95,8 @@ jobs:
             echo "ERROR: ACCOUNTS_JSON_B64 (recommended) not set. Create base64(accounts.json) and store as ACCOUNTS_JSON_B64."
             exit 1
           fi
-
           echo "Wrote src/accounts.json (size: $(wc -c < src/accounts.json) bytes). Preview first 6 lines:"
           sed -n '1,6p' src/accounts.json || true
-
           # Validate JSON: prefer jq, fallback to node
           if command -v jq >/dev/null 2>&1; then
             if jq . src/accounts.json >/dev/null 2>&1; then
@@ -119,7 +109,6 @@ jobs:
           else
             node -e "try{JSON.parse(require('fs').readFileSync('src/accounts.json','utf8')); console.log('json ok')}catch(e){console.error('Invalid JSON:', e.message); process.exit(2)}"
           fi
-
       - name: Write src/config.json from base64 secret and validate (optional)
         shell: bash
         run: |
@@ -145,7 +134,6 @@ jobs:
           else
             echo "No CONFIG_JSON provided; using repo config.json if present."
           fi
-
       - name: Install OS packages required by browsers (Playwright) (robust)
         shell: bash
         run: |
@@ -165,7 +153,6 @@ jobs:
             apt-cache policy libasound2 libasound2t64 liboss4-salsa-asound2 || true
             exit 1
           fi
-
       - name: Install Node dependencies (clean)
         shell: bash
         run: |
@@ -173,7 +160,6 @@ jobs:
           npm ci
           echo "node: $(node -v); npm: $(npm -v)"
           npm ls --depth=0 || true
-
       - name: Verify TypeScript / install if missing
         shell: bash
         run: |
@@ -185,7 +171,6 @@ jobs:
             echo "TypeScript present."
             npx tsc --version || true
           fi
-
       - name: Create tsconfig.ci.json (exclude src/accounts.json) for CI
         shell: bash
         run: |
@@ -199,7 +184,6 @@ jobs:
           else
             echo "jq missing; cannot create tsconfig.ci.json. Continuing without it."
           fi
-
       - name: Optional: Run tsc --noEmit as a quick pre-check (using tsconfig.ci.json if present)
         shell: bash
         run: |
@@ -221,7 +205,6 @@ jobs:
               npx tsc --noEmit || { echo "tsc failed; see output"; exit 1; }
             fi
           fi
-
       - name: Install Playwright OS deps helper (optional) and browsers
         shell: bash
         run: |
@@ -232,7 +215,6 @@ jobs:
           fi
           echo "Installing Playwright Chromium (with deps)..."
           npx playwright install --with-deps chromium
-
       - name: Build the project (per README) (use tsconfig.ci.json if present)
         shell: bash
         run: |
@@ -244,7 +226,6 @@ jobs:
             echo "No tsconfig.ci.json — running npm run build (default behaviour)..."
             npm run build
           fi
-
       - name: Run the built script and save logs
         shell: bash
         run: |
@@ -252,7 +233,6 @@ jobs:
           mkdir -p logs
           npm run start 2>&1 | tee logs/script.log || true
           echo "Captured logs to logs/script.log"
-
       - name: Upload logs artifact
         uses: actions/upload-artifact@v4
         with:
