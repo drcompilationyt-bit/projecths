@@ -32,7 +32,7 @@ jobs:
           node-version: ${{ env.NODE_VERSION }}
           cache: 'npm'
 
-      - name: Decide whether this scheduled run should execute (slot selection in America/Toronto)
+      - name: "Decide whether this scheduled run should execute (slot selection in America/Toronto)"
         shell: bash
         run: |
           set -euo pipefail
@@ -57,7 +57,7 @@ jobs:
           fi
           echo "This job won the day's slot (Toronto time) — continuing."
 
-      - name: Compute jitter and sleep (winning job) — skip for manual runs unless simulate_schedule=true
+      - name: "Compute jitter and sleep (winning job) — skip for manual runs unless simulate_schedule=true"
         shell: bash
         env:
           SIMULATE_SCHEDULE: ${{ env.SIMULATE_SCHEDULE }}
@@ -84,101 +84,75 @@ jobs:
           set -euo pipefail
           mkdir -p src
 
-          # Preferred: single-line base64 secret
+          # 1) Preferred: single-line base64 secret
           if [ -n "${{ secrets.ACCOUNTS_JSON_B64 }}" ]; then
             printf '%s' "${{ secrets.ACCOUNTS_JSON_B64 }}" | base64 --decode > src/accounts.json \
               || { echo "ERROR: failed to decode ACCOUNTS_JSON_B64"; exit 1; }
 
           elif [ -n "${{ secrets.ACCOUNTS_JSON }}" ]; then
             echo "ACCOUNTS_JSON present — attempting robust handling."
-            # Export the secret into an env var for Node (secret masking remains in logs)
-            export ACC_RAW="${{ secrets.ACCOUNTS_JSON }}"
+            RAW="${{ secrets.ACCOUNTS_JSON }}"
 
-            node - <<'NODE'
-const fs = require('fs');
-const raw = process.env.ACC_RAW || '';
-const trimmed = raw.trim();
+            # Strip a single pair of surrounding quotes if present (unescape literal string case)
+            case "$RAW" in
+              \"*\" ) RAW="${RAW#\"}"; RAW="${RAW%\"}" ;;
+              \'*\' ) RAW="${RAW#\'}"; RAW="${RAW%\'}" ;;
+            esac
 
-function looksLikeJson(s){ return /^[\[{]/.test(s.trim()); }
-
-let result = null;
-
-// 1) If it already looks like JSON (starts with { or [), accept it.
-if (looksLikeJson(trimmed)) {
-  result = raw;
-} else {
-  // 2) Try to parse as a JSON string literal (e.g. "\"[ {...} ]\"")
-  try {
-    const parsed = JSON.parse(raw);
-    if (typeof parsed === 'string') {
-      // parsed is the inner JSON text
-      result = parsed;
-    } else {
-      // parsed is already an object/array -> pretty-print to JSON text
-      result = JSON.stringify(parsed, null, 2);
-    }
-  } catch (e1) {
-    // 3) If there are outer quotes that weren't escaped, try to strip a single pair
-    if ((raw.startsWith('"') && raw.endsWith('"')) || (raw.startsWith("'") && raw.endsWith("'"))) {
-      const stripped = raw.slice(1, -1);
-      if (looksLikeJson(stripped)) {
-        result = stripped;
-      } else {
-        // 4) Try base64 decode of the original raw
-        try {
-          const dec = Buffer.from(raw, 'base64').toString('utf8');
-          if (looksLikeJson(dec)) result = dec;
-          else throw new Error('base64 decoded content not JSON');
-        } catch (e3) {
-          console.error('Could not interpret ACCOUNTS_JSON secret as JSON, JSON-string, or base64.');
-          process.exit(2);
-        }
-      }
-    } else {
-      // 5) Try decoding as base64 directly
-      try {
-        const dec = Buffer.from(raw, 'base64').toString('utf8');
-        if (looksLikeJson(dec)) result = dec;
-        else {
-          console.error('Secret did not parse and base64-decoded content is not JSON.');
-          process.exit(2);
-        }
-      } catch (e2) {
-        console.error('Secret did not parse as JSON and was not valid base64.');
-        process.exit(2);
-      }
-    }
-  }
-}
-
-// Final sanity check
-if (!result || !looksLikeJson(result)) {
-  console.error('Final interpreted content does not appear to be JSON.');
-  process.exit(2);
-}
-
-// Write file
-fs.writeFileSync('src/accounts.json', result, 'utf8');
-console.log('Wrote src/accounts.json (size:', fs.statSync('src/accounts.json').size, 'bytes)');
-NODE
+            # If it already looks like JSON (starts with { or [), accept it
+            case "$RAW" in
+              [\{[]* )
+                printf '%s' "$RAW" > src/accounts.json
+                ;;
+              * )
+                # Try treating RAW as base64 -> decode to temp and validate
+                TMP_DEC="$(mktemp)"
+                if printf '%s' "$RAW" | grep -Eq '^[A-Za-z0-9+/=]+$' && printf '%s' "$RAW" | base64 --decode > "$TMP_DEC" 2>/dev/null; then
+                  # Validate decoded content
+                  if command -v jq >/dev/null 2>&1; then
+                    if jq . "$TMP_DEC" >/dev/null 2>&1; then
+                      mv "$TMP_DEC" src/accounts.json
+                    else
+                      rm -f "$TMP_DEC"
+                      echo "ERROR: ACCOUNTS_JSON appears base64 but decoded content is not valid JSON."
+                      exit 1
+                    fi
+                  else
+                    # fallback to node for validation
+                    if node -e "try{JSON.parse(require('fs').readFileSync('$TMP_DEC','utf8')); process.exit(0)}catch(e){ process.exit(2) }"; then
+                      mv "$TMP_DEC" src/accounts.json
+                    else
+                      rm -f "$TMP_DEC"
+                      echo "ERROR: ACCOUNTS_JSON appears base64 but decoded content is not valid JSON (node fallback)."
+                      exit 1
+                    fi
+                  fi
+                else
+                  rm -f "$TMP_DEC" 2>/dev/null || true
+                  echo "ERROR: ACCOUNTS_JSON does not look like raw JSON and is not valid base64 → cannot interpret."
+                  exit 1
+                fi
+                ;;
+            esac
 
           else
             echo "ERROR: No ACCOUNTS_JSON_B64 or ACCOUNTS_JSON secret found. Set one of them."
             exit 1
           fi
 
-          # Small safe preview and validation (won't expose secrets)
-          echo "Preview (first 120 bytes):"
+          # Small safe preview and validation
+          echo "Wrote src/accounts.json (size: $(wc -c < src/accounts.json) bytes). Preview (first 120 bytes):"
           head -c 120 src/accounts.json || true
           echo
+
           if command -v jq >/dev/null 2>&1; then
             jq . src/accounts.json >/dev/null 2>&1 || { echo "ERROR: src/accounts.json invalid JSON according to jq"; exit 1; }
             echo "accounts.json validated by jq."
           else
-            node -e "try{JSON.parse(require('fs').readFileSync('src/accounts.json','utf8')); console.log('accounts.json validated by node') }catch(e){ console.error('Invalid JSON:', e.message); process.exit(2) }"
+            node -e "try{JSON.parse(require('fs').readFileSync('src/accounts.json','utf8')); console.log('accounts.json validated by node')}catch(e){ console.error('Invalid JSON:', e.message); process.exit(2) }"
           fi
 
-      - name: Write src/config.json from base64 secret and validate (optional)
+      - name: "Write src/config.json from base64 secret and validate (optional)"
         shell: bash
         run: |
           set -euo pipefail
@@ -204,7 +178,7 @@ NODE
             echo "No CONFIG_JSON provided; using repo config.json if present."
           fi
 
-      - name: Install OS packages required by browsers (Playwright) (robust)
+      - name: "Install OS packages required by browsers (Playwright) (robust)"
         shell: bash
         run: |
           set -euo pipefail
@@ -224,7 +198,7 @@ NODE
             exit 1
           fi
 
-      - name: Install Node dependencies (clean)
+      - name: "Install Node dependencies (clean)"
         shell: bash
         run: |
           set -euo pipefail
@@ -232,7 +206,7 @@ NODE
           echo "node: $(node -v); npm: $(npm -v)"
           npm ls --depth=0 || true
 
-      - name: Verify TypeScript / install if missing
+      - name: "Verify TypeScript / install if missing"
         shell: bash
         run: |
           set -euo pipefail
@@ -244,7 +218,7 @@ NODE
             npx tsc --version || true
           fi
 
-      - name: Create tsconfig.ci.json (exclude src/accounts.json) for CI
+      - name: "Create tsconfig.ci.json (exclude src/accounts.json) for CI"
         shell: bash
         run: |
           set -euo pipefail
@@ -280,7 +254,7 @@ NODE
             fi
           fi
 
-      - name: Install Playwright OS deps helper (optional) and browsers
+      - name: "Install Playwright OS deps helper (optional) and browsers"
         shell: bash
         run: |
           set -euo pipefail
@@ -291,7 +265,7 @@ NODE
           echo "Installing Playwright Chromium (with deps)..."
           npx playwright install --with-deps chromium
 
-      - name: Build the project (per README) (use tsconfig.ci.json if present)
+      - name: "Build the project (per README) (use tsconfig.ci.json if present)"
         shell: bash
         run: |
           set -euo pipefail
@@ -303,7 +277,7 @@ NODE
             npm run build
           fi
 
-      - name: Run the built script and save logs
+      - name: "Run the built script and save logs"
         shell: bash
         run: |
           set -euo pipefail
@@ -312,7 +286,7 @@ NODE
           npm run start 2>&1 | tee logs/script.log || true
           echo "Captured logs to logs/script.log"
 
-      - name: Upload logs artifact
+      - name: "Upload logs artifact"
         if: always()
         uses: actions/upload-artifact@v4
         with:
