@@ -87,11 +87,35 @@ jobs:
             echo "CONFIG_JSON not provided; using repo config.json if present."
           fi
 
-      - name: "Install OS packages required by browsers (Playwright)"
+      - name: "Install OS packages required by browsers (Playwright) (robust)"
         shell: bash
         run: |
+          set -euo pipefail
+
+          echo "Updating apt..."
           sudo apt-get update -y
-          sudo apt-get install -y libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libxss1 libasound2 libxcomposite1 libxdamage1 libxrandr2 libgtk-3-0 libgbm1 ca-certificates fonts-liberation libappindicator3-1 libatspi2.0-0 lsb-release
+
+          # base list (without libasound2 which may be renamed on ubuntu 24.04)
+          BASE_PKGS="libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libxss1 libxcomposite1 libxdamage1 libxrandr2 libgtk-3-0 libgbm1 ca-certificates fonts-liberation libappindicator3-1 libatspi2.0-0 lsb-release"
+
+          echo "Attempting to install system packages (with libasound2 fallback logic)..."
+          if sudo apt-get install -y $BASE_PKGS libasound2; then
+            echo "Installed with libasound2"
+          else
+            echo "libasound2 not available, trying libasound2t64..."
+            if sudo apt-get install -y $BASE_PKGS libasound2t64; then
+              echo "Installed with libasound2t64"
+            else
+              echo "libasound2t64 not available, trying liboss4-salsa-asound2..."
+              if sudo apt-get install -y $BASE_PKGS liboss4-salsa-asound2; then
+                echo "Installed with liboss4-salsa-asound2"
+              else
+                echo "Failed to install any libasound provider; printing apt-cache policy for debugging"
+                apt-cache policy libasound2 libasound2t64 liboss4-salsa-asound2 || true
+                exit 1
+              fi
+            fi
+          fi
 
       - name: "Install Node dependencies (clean)"
         shell: bash
@@ -111,9 +135,18 @@ jobs:
             npx tsc --version || true
           fi
 
-      - name: "Install Playwright browser(s)"
+      - name: "Install Playwright OS deps helper (optional) and browsers"
         shell: bash
         run: |
+          # Optional helper that attempts to install needed OS deps for Playwright on Debian/Ubuntu.
+          # This is complementary; the robust apt step above should handle the main issue.
+          if command -v npx >/dev/null 2>&1; then
+            echo "Running npx playwright install-deps (may require sudo)..."
+            # allow this to fail non-fatally on images where the helper isn't supported
+            npx playwright install-deps || true
+          fi
+
+          echo "Installing Playwright Chromium (with deps)..."
           npx playwright install --with-deps chromium
 
       - name: "Build the project (per README)"
@@ -133,4 +166,3 @@ jobs:
         with:
           name: microsoft-rewards-logs-${{ github.run_id }}
           path: logs/script.log
-          
