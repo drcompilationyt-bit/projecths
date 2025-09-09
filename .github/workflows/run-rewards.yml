@@ -7,7 +7,12 @@ on:
     - cron: '0 13 * * *'
     - cron: '0 14 * * *'
     - cron: '0 15 * * *'
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      simulate_schedule:
+        description: 'Set to true to simulate schedule behavior (enable jitter) for manual runs'
+        required: false
+        default: 'false'
 
 jobs:
   run-rewards:
@@ -15,6 +20,8 @@ jobs:
     timeout-minutes: 360
     env:
       NODE_VERSION: '18'
+      # propagate the workflow_dispatch input into an env var for steps to read
+      SIMULATE_SCHEDULE: ${{ github.event.inputs.simulate_schedule || 'false' }}
 
     steps:
       - name: "Checkout repo"
@@ -54,17 +61,28 @@ jobs:
 
           echo "This job won the day's slot (Toronto time) — continuing."
 
-      - name: "Compute jitter and sleep (winning job)"
+      - name: "Compute jitter and sleep (winning job) — skip for manual runs unless simulate_schedule=true"
         shell: bash
+        env:
+          SIMULATE_SCHEDULE: ${{ env.SIMULATE_SCHEDULE }}
         run: |
-          LOCAL_DATE=$(TZ='America/Toronto' date +%F)
-          LOCAL_HOUR=$(TZ='America/Toronto' date +%H)
-          HASH2=$(printf '%s' "${LOCAL_DATE}${LOCAL_HOUR}" | sha256sum | awk '{print $1}')
-          LAST2=${HASH2: -2}
-          DEC=$((16#$LAST2))
-          JITTER_MIN=$((DEC % 60))
-          echo "Sleeping for ${JITTER_MIN} minute(s) (Toronto local jitter)"
-          sleep $((JITTER_MIN * 60))
+          set -euo pipefail
+          # GITHUB_EVENT_NAME is provided by Actions runner
+          EVENT_NAME="${GITHUB_EVENT_NAME:-}"
+          echo "Event name: $EVENT_NAME  simulate_schedule: ${SIMULATE_SCHEDULE:-}"
+
+          if [ "$EVENT_NAME" = "workflow_dispatch" ] && [ "${SIMULATE_SCHEDULE:-}" != "true" ]; then
+            echo "Manual run detected and simulate_schedule != true — skipping jitter sleep."
+          else
+            LOCAL_DATE=$(TZ='America/Toronto' date +%F)
+            LOCAL_HOUR=$(TZ='America/Toronto' date +%H)
+            HASH2=$(printf '%s' "${LOCAL_DATE}${LOCAL_HOUR}" | sha256sum | awk '{print $1}')
+            LAST2=${HASH2: -2}
+            DEC=$((16#$LAST2))
+            JITTER_MIN=$((DEC % 60))
+            echo "Sleeping for ${JITTER_MIN} minute(s) (Toronto local jitter)"
+            sleep $((JITTER_MIN * 60))
+          fi
 
       - name: "Write & validate src/accounts.json (supports base64 or raw secret)"
         shell: bash
@@ -181,7 +199,7 @@ jobs:
             # Create a CI copy that ensures src/accounts.json is excluded (no in-place edits)
             jq '(.exclude //= []) | .exclude |= (.+["src/accounts.json"] | unique)' tsconfig.json > tsconfig.ci.json
             echo "Wrote tsconfig.ci.json (tsconfig.json copy with src/accounts.json excluded)"
-            echo "tsconfig.ci.json preview (first 80 chars):"
+            echo "tsconfig.ci.json preview (first 320 chars):"
             head -c 320 tsconfig.ci.json || true
           else
             if [ ! -f tsconfig.json ]; then
