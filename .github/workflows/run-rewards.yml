@@ -56,6 +56,7 @@ jobs:
             exit 0
           fi
           echo "This job won the day's slot (Toronto time) — continuing."
+
       - name: Compute jitter and sleep (winning job) — skip for manual runs unless simulate_schedule=true
         shell: bash
         env:
@@ -76,39 +77,107 @@ jobs:
             echo "Sleeping for ${JITTER_MIN} minute(s) (Toronto local jitter)"
             sleep $((JITTER_MIN * 60))
           fi
-      - name: Write src/accounts.json from base64 secret and validate (safe)
+
+      - name: "Write src/accounts.json from secret (handles string-wrapped JSON and base64)"
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p src
-          # Prefer ACCOUNTS_JSON_B64 (base64 of the JSON with no line wraps).
+
+          # 1) Preferred: single-line base64 secret
           if [ -n "${{ secrets.ACCOUNTS_JSON_B64 }}" ]; then
-            echo "Decoding ACCOUNTS_JSON_B64 -> src/accounts.json"
-            printf '%s' "${{ secrets.ACCOUNTS_JSON_B64 }}" | base64 --decode > src/accounts.json
+            printf '%s' "${{ secrets.ACCOUNTS_JSON_B64 }}" | base64 --decode > src/accounts.json \
+              || { echo "ERROR: failed to decode ACCOUNTS_JSON_B64"; exit 1; }
+
           elif [ -n "${{ secrets.ACCOUNTS_JSON }}" ]; then
-            echo "ACCOUNTS_JSON_B64 not present, using raw ACCOUNTS_JSON fallback (fragile)"
-            RAW="${{ secrets.ACCOUNTS_JSON }}"
-            RAW="${RAW#\"}"; RAW="${RAW%\"}"
-            RAW="${RAW#\'}"; RAW="${RAW%\'}"
-            printf '%s' "$RAW" > src/accounts.json
+            echo "ACCOUNTS_JSON present — attempting robust handling."
+            # Export the secret into an env var for Node (secret masking remains in logs)
+            export ACC_RAW="${{ secrets.ACCOUNTS_JSON }}"
+
+            node - <<'NODE'
+const fs = require('fs');
+const raw = process.env.ACC_RAW || '';
+const trimmed = raw.trim();
+
+function looksLikeJson(s){ return /^[\[{]/.test(s.trim()); }
+
+let result = null;
+
+// 1) If it already looks like JSON (starts with { or [), accept it.
+if (looksLikeJson(trimmed)) {
+  result = raw;
+} else {
+  // 2) Try to parse as a JSON string literal (e.g. "\"[ {...} ]\"")
+  try {
+    const parsed = JSON.parse(raw);
+    if (typeof parsed === 'string') {
+      // parsed is the inner JSON text
+      result = parsed;
+    } else {
+      // parsed is already an object/array -> pretty-print to JSON text
+      result = JSON.stringify(parsed, null, 2);
+    }
+  } catch (e1) {
+    // 3) If there are outer quotes that weren't escaped, try to strip a single pair
+    if ((raw.startsWith('"') && raw.endsWith('"')) || (raw.startsWith("'") && raw.endsWith("'"))) {
+      const stripped = raw.slice(1, -1);
+      if (looksLikeJson(stripped)) {
+        result = stripped;
+      } else {
+        // 4) Try base64 decode of the original raw
+        try {
+          const dec = Buffer.from(raw, 'base64').toString('utf8');
+          if (looksLikeJson(dec)) result = dec;
+          else throw new Error('base64 decoded content not JSON');
+        } catch (e3) {
+          console.error('Could not interpret ACCOUNTS_JSON secret as JSON, JSON-string, or base64.');
+          process.exit(2);
+        }
+      }
+    } else {
+      // 5) Try decoding as base64 directly
+      try {
+        const dec = Buffer.from(raw, 'base64').toString('utf8');
+        if (looksLikeJson(dec)) result = dec;
+        else {
+          console.error('Secret did not parse and base64-decoded content is not JSON.');
+          process.exit(2);
+        }
+      } catch (e2) {
+        console.error('Secret did not parse as JSON and was not valid base64.');
+        process.exit(2);
+      }
+    }
+  }
+}
+
+// Final sanity check
+if (!result || !looksLikeJson(result)) {
+  console.error('Final interpreted content does not appear to be JSON.');
+  process.exit(2);
+}
+
+// Write file
+fs.writeFileSync('src/accounts.json', result, 'utf8');
+console.log('Wrote src/accounts.json (size:', fs.statSync('src/accounts.json').size, 'bytes)');
+NODE
+
           else
-            echo "ERROR: ACCOUNTS_JSON_B64 (recommended) not set. Create base64(accounts.json) and store as ACCOUNTS_JSON_B64."
+            echo "ERROR: No ACCOUNTS_JSON_B64 or ACCOUNTS_JSON secret found. Set one of them."
             exit 1
           fi
-          echo "Wrote src/accounts.json (size: $(wc -c < src/accounts.json) bytes). Preview first 6 lines:"
-          sed -n '1,6p' src/accounts.json || true
-          # Validate JSON: prefer jq, fallback to node
+
+          # Small safe preview and validation (won't expose secrets)
+          echo "Preview (first 120 bytes):"
+          head -c 120 src/accounts.json || true
+          echo
           if command -v jq >/dev/null 2>&1; then
-            if jq . src/accounts.json >/dev/null 2>&1; then
-              echo "accounts.json validated by jq as proper JSON."
-            else
-              echo "Invalid JSON according to jq. Please re-create the secret as base64 of valid JSON and try again."
-              sed -n '1,200p' src/accounts.json || true
-              exit 1
-            fi
+            jq . src/accounts.json >/dev/null 2>&1 || { echo "ERROR: src/accounts.json invalid JSON according to jq"; exit 1; }
+            echo "accounts.json validated by jq."
           else
-            node -e "try{JSON.parse(require('fs').readFileSync('src/accounts.json','utf8')); console.log('json ok')}catch(e){console.error('Invalid JSON:', e.message); process.exit(2)}"
+            node -e "try{JSON.parse(require('fs').readFileSync('src/accounts.json','utf8')); console.log('accounts.json validated by node') }catch(e){ console.error('Invalid JSON:', e.message); process.exit(2) }"
           fi
+
       - name: Write src/config.json from base64 secret and validate (optional)
         shell: bash
         run: |
@@ -134,6 +203,7 @@ jobs:
           else
             echo "No CONFIG_JSON provided; using repo config.json if present."
           fi
+
       - name: Install OS packages required by browsers (Playwright) (robust)
         shell: bash
         run: |
@@ -153,6 +223,7 @@ jobs:
             apt-cache policy libasound2 libasound2t64 liboss4-salsa-asound2 || true
             exit 1
           fi
+
       - name: Install Node dependencies (clean)
         shell: bash
         run: |
@@ -160,6 +231,7 @@ jobs:
           npm ci
           echo "node: $(node -v); npm: $(npm -v)"
           npm ls --depth=0 || true
+
       - name: Verify TypeScript / install if missing
         shell: bash
         run: |
@@ -171,6 +243,7 @@ jobs:
             echo "TypeScript present."
             npx tsc --version || true
           fi
+
       - name: Create tsconfig.ci.json (exclude src/accounts.json) for CI
         shell: bash
         run: |
@@ -184,6 +257,7 @@ jobs:
           else
             echo "jq missing; cannot create tsconfig.ci.json. Continuing without it."
           fi
+
       - name: "Optional: Run tsc --noEmit as a quick pre-check (using tsconfig.ci.json if present)"
         shell: bash
         run: |
@@ -205,6 +279,7 @@ jobs:
               npx tsc --noEmit || { echo "tsc failed; see output"; exit 1; }
             fi
           fi
+
       - name: Install Playwright OS deps helper (optional) and browsers
         shell: bash
         run: |
@@ -215,6 +290,7 @@ jobs:
           fi
           echo "Installing Playwright Chromium (with deps)..."
           npx playwright install --with-deps chromium
+
       - name: Build the project (per README) (use tsconfig.ci.json if present)
         shell: bash
         run: |
@@ -226,6 +302,7 @@ jobs:
             echo "No tsconfig.ci.json — running npm run build (default behaviour)..."
             npm run build
           fi
+
       - name: Run the built script and save logs
         shell: bash
         run: |
@@ -234,6 +311,7 @@ jobs:
           # run script and capture output; don't fail the job on script exit (the log will be available)
           npm run start 2>&1 | tee logs/script.log || true
           echo "Captured logs to logs/script.log"
+
       - name: Upload logs artifact
         if: always()
         uses: actions/upload-artifact@v4
