@@ -1,8 +1,10 @@
-name: "Run Microsoft Rewards Script (randomized start around 08:00 Toronto, EST-only)"
+name: "Run Microsoft Rewards Script (randomized start around 08:00 Toronto local)"
 
 on:
   schedule:
-    - cron: '0 13 * * *'
+    # Run twice (covers both DST and standard time for Toronto).
+    - cron: '0 12 * * *'   # 12:00 UTC -> 08:00 Toronto during DST (UTC-4)
+    - cron: '0 13 * * *'   # 13:00 UTC -> 08:00 Toronto during standard time (UTC-5)
   workflow_dispatch:
     inputs:
       simulate_schedule:
@@ -29,7 +31,7 @@ jobs:
           cache: 'npm'
           cache-dependency-path: package-lock.json
 
-      - name: "Decide whether this scheduled run should continue (EST-only target: local 08:00)"
+      - name: "Decide whether this scheduled run should continue (Toronto 08:00 local gate)"
         shell: bash
         run: |
           set -euo pipefail
@@ -37,9 +39,11 @@ jobs:
           if [ "$EVENT_NAME" = "workflow_dispatch" ] && [ "${SIMULATE_SCHEDULE:-}" != "true" ]; then
             echo "Manual run requested (no hour check)."
           else
+            # Get local hour in America/Toronto (00..23) and remove leading zero
             LOCAL_HOUR=$(TZ='America/Toronto' date +%H | sed 's/^0//')
+            echo "Toronto local hour: ${LOCAL_HOUR}"
             if [ "$LOCAL_HOUR" -ne 8 ]; then
-              echo "Local hour is not 8 (EST target) — exiting."
+              echo "Local hour is not 8 (Toronto local target) — exiting."
               exit 0
             fi
             echo "Local hour is 8 — continuing."
@@ -49,7 +53,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ] && [ "${SIMULATE_SCHEDULE:-}" != "true" ]; then
+          # Skip jitter for manual runs if simulate flag not set to true
+          if [ "${GITHUB_EVENT_NAME:-}" = "workflow_dispatch" ] && [ "${SIMULATE_SCHEDULE:-}" != "true" ]; then
             echo "Manual run — skipping jitter."
           else
             JITTER_SEC=$(( $(od -An -N4 -tu4 /dev/urandom | tr -d ' ') % (90*60 + 1) ))
@@ -59,12 +64,97 @@ jobs:
 
       - name: "Write src/accounts.json from secret (robust + debug)"
         shell: bash
+        env:
+          # Provide the secrets names you use; both options supported:
+          ACCOUNTS_JSON_B64: ${{ secrets.ACCOUNTS_JSON_B64 || '' }}
+          ACCOUNTS_JSON: ${{ secrets.ACCOUNTS_JSON || '' }}
         run: |
           set -euo pipefail
           mkdir -p src
-          # (the same robust writer you already have — omitted here for brevity)
-          # ... paste your robust writer script here or keep the existing step ...
-          echo "WROTE accounts.json (debug omitted in snippet)"
+
+          echo "=== Debug: repo root listing ==="
+          ls -la
+
+          # Prefer base64 secret if present
+          if [ -n "${ACCOUNTS_JSON_B64:-}" ]; then
+            echo "Found ACCOUNTS_JSON_B64 (non-empty) — decoding to src/accounts.json"
+            if printf '%s' "$ACCOUNTS_JSON_B64" | base64 --decode > src/accounts.json 2>/dev/null; then
+              echo "Decoded ACCOUNTS_JSON_B64 -> src/accounts.json"
+            else
+              echo "ERROR: failed to decode ACCOUNTS_JSON_B64" >&2
+              exit 1
+            fi
+
+          elif [ -n "${ACCOUNTS_JSON:-}" ]; then
+            echo "Found ACCOUNTS_JSON (non-empty) — processing..."
+            RAW="$ACCOUNTS_JSON"
+
+            # Strip a single surrounding quote if present
+            case "$RAW" in
+              \"*\" ) RAW="${RAW#\"}"; RAW="${RAW%\"}" ;;
+              \'*\' ) RAW="${RAW#\'}"; RAW="${RAW%\'}" ;;
+            esac
+
+            # If it looks like raw JSON, write it directly
+            case "$RAW" in
+              [\{[]* )
+                printf '%s' "$RAW" > src/accounts.json
+                echo "Wrote raw JSON to src/accounts.json"
+                ;;
+              * )
+                TMP=$(mktemp)
+                if printf '%s' "$RAW" | base64 --decode > "$TMP" 2>/dev/null; then
+                  # Validate decoded content is JSON before moving into place
+                  if command -v jq >/dev/null 2>&1; then
+                    if jq . "$TMP" >/dev/null 2>&1; then
+                      mv "$TMP" src/accounts.json
+                      echo "Decoded base64 secret and moved to src/accounts.json (validated with jq)"
+                    else
+                      rm -f "$TMP"
+                      echo "ERROR: ACCOUNTS_JSON appears base64 but decoded content is not valid JSON." >&2
+                      exit 1
+                    fi
+                  else
+                    if node -e "try{JSON.parse(require('fs').readFileSync('$TMP','utf8')); process.exit(0)}catch(e){ process.exit(2) }"; then
+                      mv "$TMP" src/accounts.json
+                      echo "Decoded base64 secret and moved to src/accounts.json (validated with node)"
+                    else
+                      rm -f "$TMP"
+                      echo "ERROR: ACCOUNTS_JSON appears base64 but decoded content is not valid JSON (node validation failed)." >&2
+                      exit 1
+                    fi
+                  fi
+                else
+                  echo "ERROR: ACCOUNTS_JSON does not look like raw JSON and is not valid base64 -> cannot interpret." >&2
+                  rm -f "$TMP" 2>/dev/null || true
+                  exit 1
+                fi
+                ;;
+            esac
+
+          else
+            echo "No ACCOUNTS_JSON_B64 or ACCOUNTS_JSON secret found in runner environment." >&2
+            echo "Attempting to fallback to example files in repo..."
+            if [ -f src/accounts.example.json ]; then
+              cp src/accounts.example.json src/accounts.json
+              echo "Copied src/accounts.example.json -> src/accounts.json (example fallback)."
+            elif [ -f accounts.example.json ]; then
+              cp accounts.example.json src/accounts.json
+              echo "Copied accounts.example.json -> src/accounts.json (example fallback)."
+            else
+              echo "ERROR: No secrets and no example file available. Please set ACCOUNTS_JSON or ACCOUNTS_JSON_B64 secret." >&2
+              ls -la || true
+              exit 1
+            fi
+          fi
+
+          # Validate JSON without printing sensitive content
+          if command -v jq >/dev/null 2>&1; then
+            jq . src/accounts.json >/dev/null || { echo "Invalid JSON in src/accounts.json" >&2; exit 1; }
+            echo "src/accounts.json validated by jq."
+          else
+            node -e "try{JSON.parse(require('fs').readFileSync('src/accounts.json','utf8')); console.log('src/accounts.json validated by node')}catch(e){ console.error('Invalid JSON:', e.message); process.exit(2) }"
+          fi
 
       - name: "Install Node dependencies (npm ci)"
         run: npm ci --no-audit --no-fund
@@ -88,17 +178,30 @@ jobs:
         run: |
           set -eux
           sudo apt-get update
-          # install Xvfb and some typical X libs (keeps package small)
           sudo apt-get install -y xvfb
-          # optionally ensure fonts, etc. Playwright --with-deps often installed wide deps already
+          # optional extra libs if your script needs them
           dpkg -l | head -n 20
 
       - name: "Build the project"
         run: npm run build
 
+      - name: "Ensure dist/accounts.json exists (copy after build)"
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          if [ -f src/accounts.json ]; then
+            cp src/accounts.json dist/accounts.json
+            echo "Copied src/accounts.json -> dist/accounts.json"
+          else
+            echo "WARNING: src/accounts.json missing after build — job may fail." >&2
+            ls -la src || true
+          fi
+
       - name: "Create runtime File polyfill (fallback)"
         shell: bash
         run: |
+          set -euo pipefail
           mkdir -p dist
           cat > dist/polyfill-file.js <<'EOF'
           if (typeof globalThis.File === 'undefined') {
@@ -111,6 +214,7 @@ jobs:
             };
           }
           EOF
+          echo "Wrote dist/polyfill-file.js"
 
       - name: "Run the built script under Xvfb (headed allowed) and save logs"
         shell: bash
@@ -118,7 +222,6 @@ jobs:
           set -euo pipefail
           mkdir -p logs
           # Run headed browser under virtual X server. This lets headless:false work.
-          # Use --auto-servernum so multiple jobs don't collide, and set a reasonable screen size.
           xvfb-run --auto-servernum --server-args='-screen 0 1280x1024x24' \
             node -r ./dist/polyfill-file.js ./dist/index.js 2>&1 | tee logs/script.log || true
           echo "Captured logs to logs/script.log"
@@ -128,9 +231,24 @@ jobs:
         run: |
           set -euo pipefail
           cp logs/script.log logs/script.log.raw || true
-          sed -E -i 's/("password"[[:space:]]*:[[:space:]]*)"[^"]*"/\1"***REDACTED***"/Ig' logs.script.log
-          # other redaction lines...
+
+          # JSON-style password fields
+          sed -E -i 's/("password"[[:space:]]*:[[:space:]]*)"[^"]*"/\1"***REDACTED***"/Ig' logs/script.log
+
+          # Generic "password" or "pass" lines
+          sed -E -i 's/([Pp]ass(word)?[[:space:]]*[:=][[:space:]]*)[^[:space:],;]+/\1***REDACTED***/g' logs/script.log
+
+          # Emails
+          sed -E -i 's/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/***REDACTED_EMAIL***/g' logs/script.log
+
+          # Authorization headers / tokens
+          sed -E -i 's/([Aa]uthorization[[:space:]]*[:=][[:space:]]*(Bearer|Basic)?[[:space:]]*)[^[:space:]]+/\1***REDACTED***/g' logs/script.log
+
+          # Long base64-like strings
+          sed -E -i 's/[A-Za-z0-9+/]{40,}={0,2}/***REDACTED_BASE64***/g' logs/script.log || true
+
           rm -f logs/script.log.raw || true
+          echo "Sanitized logs; saved sanitized logs/script.log"
 
       - name: "Upload logs"
         if: always()
