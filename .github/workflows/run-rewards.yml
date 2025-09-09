@@ -62,9 +62,89 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p src
-          # (the same robust writer you already have — omitted here for brevity)
-          # ... paste your robust writer script here or keep the existing step ...
-          echo "WROTE accounts.json (debug omitted in snippet)"
+
+          echo "=== Debug: repo root listing ==="
+          ls -la
+
+          if [ -n "${{ secrets.ACCOUNTS_JSON_B64 }}" ]; then
+            echo "Found secret: ACCOUNTS_JSON_B64 (non-empty) — attempting base64 decode..."
+            if printf '%s' "${{ secrets.ACCOUNTS_JSON_B64 }}" | base64 --decode > src/accounts.json 2>/dev/null; then
+              echo "Decoded ACCOUNTS_JSON_B64 -> src/accounts.json"
+            else
+              echo "ERROR: failed to decode ACCOUNTS_JSON_B64"; ls -la src || true; exit 1
+            fi
+
+          elif [ -n "${{ secrets.ACCOUNTS_JSON }}" ]; then
+            echo "Found secret: ACCOUNTS_JSON (non-empty) — processing..."
+            RAW="${{ secrets.ACCOUNTS_JSON }}"
+
+            case "$RAW" in
+              \"*\" ) RAW="${RAW#\"}"; RAW="${RAW%\"}" ;;
+              \'*\' ) RAW="${RAW#\'}"; RAW="${RAW%\'}" ;;
+            esac
+
+            echo "Length of secret after stripping: ${#RAW}"
+
+            case "$RAW" in
+              [\{[]* )
+                printf '%s' "$RAW" > src/accounts.json
+                echo "Wrote raw JSON to src/accounts.json"
+                ;;
+              * )
+                TMP=$(mktemp)
+                if printf '%s' "$RAW" | base64 --decode > "$TMP" 2>/dev/null; then
+                  if command -v jq >/dev/null 2>&1; then
+                    if jq . "$TMP" >/dev/null 2>&1; then
+                      mv "$TMP" src/accounts.json
+                      echo "Decoded base64 secret and moved to src/accounts.json"
+                    else
+                      rm -f "$TMP"
+                      echo "ERROR: ACCOUNTS_JSON appears base64 but decoded content is not valid JSON."
+                      exit 1
+                    fi
+                  else
+                    if node -e "try{JSON.parse(require('fs').readFileSync('$TMP','utf8')); process.exit(0)}catch(e){ process.exit(2) }"; then
+                      mv "$TMP" src.accounts.json
+                      echo "Decoded base64 secret and moved to src/accounts.json (node validation)"
+                    else
+                      rm -f "$TMP"
+                      echo "ERROR: ACCOUNTS_JSON appears base64 but decoded content is not valid JSON (node fallback)."
+                      exit 1
+                    fi
+                  fi
+                else
+                  rm -f "$TMP" 2>/dev/null || true
+                  echo "ERROR: ACCOUNTS_JSON does not look like raw JSON and is not valid base64 → cannot interpret."
+                  exit 1
+                fi
+                ;;
+            esac
+
+          else
+            echo "No ACCOUNTS_JSON_B64 or ACCOUNTS_JSON secret found in runner environment."
+            echo "Attempting to fallback to example files in repo..."
+            if [ -f src/accounts.example.json ]; then
+              cp src/accounts.example.json src/accounts.json
+              echo "Copied src/accounts.example.json -> src.accounts.json (example fallback)."
+            elif [ -f accounts.example.json ]; then
+              cp accounts.example.json src/accounts.json
+              echo "Copied accounts.example.json -> src.accounts.json (example fallback)."
+            else
+              echo "ERROR: No secrets and no example file available. Please set ACCOUNTS_JSON or ACCOUNTS_JSON_B64 secret."
+              ls -la || true
+              exit 1
+            fi
+          fi
+
+          if command -v jq >/dev/null 2>&1; then
+            if jq . src.accounts.json >/dev/null 2>&1; then
+              echo "src/accounts.json validated by jq."
+            else
+              echo "ERROR: src/accounts.json invalid JSON according to jq"; ls -la src || true; exit 1
+            fi
+          else
+            node -e "try{JSON.parse(require('fs').readFileSync('src/accounts.json','utf8')); console.log('accounts.json validated by node')}catch(e){ console.error('Invalid JSON:', e.message); process.exit(2) }"
+          fi
 
       - name: "Install Node dependencies (npm ci)"
         run: npm ci --no-audit --no-fund
@@ -83,20 +163,26 @@ jobs:
           set -euo pipefail
           npx --yes playwright install --with-deps chromium
 
-      - name: "Install xvfb (virtual X server) so headed browsers can run"
-        shell: bash
-        run: |
-          set -eux
-          sudo apt-get update
-          # install Xvfb and some typical X libs (keeps package small)
-          sudo apt-get install -y xvfb
-          # optionally ensure fonts, etc. Playwright --with-deps often installed wide deps already
-          dpkg -l | head -n 20
-
       - name: "Build the project"
         run: npm run build
 
-      - name: "Create runtime File polyfill (fallback)"
+      # ------------------ NEW: ensure runtime can access accounts.json ------------------
+      - name: "Copy src/accounts.json into dist (so runtime can read it)"
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f src/accounts.json ]; then
+            mkdir -p dist
+            cp src/accounts.json dist/accounts.json
+            echo "Copied src/accounts.json -> dist/accounts.json"
+            echo "dist/accounts.json size: $(wc -c < dist/accounts.json) bytes"
+          else
+            echo "Warning: src/accounts.json not found; nothing copied to dist. If this is unexpected, check previous step outputs."
+            ls -la src || true
+          fi
+      # -------------------------------------------------------------------------------
+
+      - name: "Create runtime File polyfill (fallback for older Node runtimes)"
         shell: bash
         run: |
           mkdir -p dist
@@ -111,26 +197,34 @@ jobs:
             };
           }
           EOF
+          echo "Wrote dist/polyfill-file.js"
 
-      - name: "Run the built script under Xvfb (headed allowed) and save logs"
+      - name: "Run the built script and save logs (preload polyfill)"
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p logs
-          # Run headed browser under virtual X server. This lets headless:false work.
-          # Use --auto-servernum so multiple jobs don't collide, and set a reasonable screen size.
-          xvfb-run --auto-servernum --server-args='-screen 0 1280x1024x24' \
-            node -r ./dist/polyfill-file.js ./dist/index.js 2>&1 | tee logs/script.log || true
-          echo "Captured logs to logs/script.log"
+          node -r ./dist/polyfill-file.js ./dist/index.js 2>&1 | tee logs/script.log || true
+          echo "Captured logs to logs/script.log (if any)"
 
-      - name: "Sanitize logs"
+      - name: "Sanitize logs (guarded)"
         shell: bash
         run: |
           set -euo pipefail
-          cp logs/script.log logs/script.log.raw || true
-          sed -E -i 's/("password"[[:space:]]*:[[:space:]]*)"[^"]*"/\1"***REDACTED***"/Ig' logs.script.log
-          # other redaction lines...
-          rm -f logs/script.log.raw || true
+          if [ -f logs/script.log ]; then
+            cp logs/script.log logs/script.log.raw || true
+            sed -E -i 's/("password"[[:space:]]*:[[:space:]]*)"[^"]*"/\1"***REDACTED***"/Ig' logs/script.log || true
+            sed -E -i 's/([Pp]ass(word)?[[:space:]]*[:=][[:space:]]*)[^[:space:],;]+/\1***REDACTED***/g' logs/script.log || true
+            sed -E -i 's/[^[:space:]]*@gmail\.com/***REDACTED_GMAIL***/g' logs/script.log || true
+            sed -E -i 's/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/***REDACTED_EMAIL***/g' logs/script.log || true
+            sed -E -i 's/([Aa]uthorization[[:space:]]*[:=][[:space:]]*(Bearer|Basic)?[[:space:]]*)[^[:space:]]+/\1***REDACTED***/g' logs.script.log || true
+            sed -E -i 's/[A-Za-z0-9+/]{40,}={0,2}/***REDACTED_BASE64***/g' logs/script.log || true
+            sed -E -i 's/("password"[[:space:]]*:[[:space:]]*)"see"/\1"***REDACTED***"/Ig' logs.script.log || true
+            rm -f logs.script.log.raw || true
+            echo "Sanitized logs/script.log"
+          else
+            echo "No logs/script.log found — skipping sanitization"
+          fi
 
       - name: "Upload logs"
         if: always()
