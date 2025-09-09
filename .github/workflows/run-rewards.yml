@@ -23,16 +23,16 @@ jobs:
       SIMULATE_SCHEDULE: ${{ github.event.inputs.simulate_schedule || 'false' }}
 
     steps:
-      - name: "Checkout repo"
+      - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: "Setup Node"
+      - name: Setup Node
         uses: actions/setup-node@v4
         with:
           node-version: ${{ env.NODE_VERSION }}
           cache: 'npm'
 
-      - name: "Decide whether this scheduled run should execute (slot selection in America/Toronto)"
+      - name: Decide whether this scheduled run should execute (slot selection in America/Toronto)
         shell: bash
         run: |
           LOCAL_DATE=$(TZ='America/Toronto' date +%F)
@@ -60,7 +60,7 @@ jobs:
 
           echo "This job won the day's slot (Toronto time) — continuing."
 
-      - name: "Compute jitter and sleep (winning job) — skip for manual runs unless simulate_schedule=true"
+      - name: Compute jitter and sleep (winning job) — skip for manual runs unless simulate_schedule=true
         shell: bash
         env:
           SIMULATE_SCHEDULE: ${{ env.SIMULATE_SCHEDULE }}
@@ -82,186 +82,85 @@ jobs:
             sleep $((JITTER_MIN * 60))
           fi
 
-      - name: "Write & robustly validate/repair src/accounts.json (supports base64 or raw secret)"
+      - name: Write src/accounts.json from base64 secret and validate (safe)
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p src
 
+          # Prefer ACCOUNTS_JSON_B64 (base64 of the JSON with no line wraps).
           if [ -n "${{ secrets.ACCOUNTS_JSON_B64 }}" ]; then
-            echo "Using ACCOUNTS_JSON_B64 (recommended)"
-            printf '%s' "${{ secrets.ACCOUNTS_JSON_B64 }}" | base64 --decode > src/accounts.json || { echo "ERROR: base64 decode failed"; exit 1; }
+            echo "Decoding ACCOUNTS_JSON_B64 -> src/accounts.json"
+            printf '%s' "${{ secrets.ACCOUNTS_JSON_B64 }}" | base64 --decode > src/accounts.json
           elif [ -n "${{ secrets.ACCOUNTS_JSON }}" ]; then
-            echo "Using raw ACCOUNTS_JSON secret (falling back)"
+            # fallback (less reliable): raw JSON secret
+            echo "ACCOUNTS_JSON_B64 not present, using raw ACCOUNTS_JSON fallback (fragile)"
             RAW="${{ secrets.ACCOUNTS_JSON }}"
+            # strip accidental surrounding quotes
             RAW="${RAW#\"}"; RAW="${RAW%\"}"
             RAW="${RAW#\'}"; RAW="${RAW%\'}"
             printf '%s' "$RAW" > src/accounts.json
           else
-            echo "ERROR: Neither ACCOUNTS_JSON_B64 nor ACCOUNTS_JSON secret present"
+            echo "ERROR: ACCOUNTS_JSON_B64 (recommended) not set. Create base64(accounts.json) and store as ACCOUNTS_JSON_B64."
             exit 1
           fi
 
-          echo "wrote src/accounts.json - size: $(wc -c < src/accounts.json) bytes"
-          echo "Preview (first 10 lines):"
-          sed -n '1,10p' src/accounts.json || true
+          echo "Wrote src/accounts.json (size: $(wc -c < src/accounts.json) bytes). Preview first 6 lines:"
+          sed -n '1,6p' src/accounts.json || true
 
-          # Validate via jq first (fast, strict)
+          # Validate JSON: prefer jq, fallback to node
           if command -v jq >/dev/null 2>&1; then
             if jq . src/accounts.json >/dev/null 2>&1; then
               echo "accounts.json validated by jq as proper JSON."
             else
-              echo "jq parse failed — attempting Node-based repair (see warnings below)."
-              # Create repair script and run it
-              cat > /tmp/repair_accounts.js <<'JS'
-/*
- Repair attempts for malformed accounts file:
- 1) If it's valid JSON — do nothing.
- 2) Try eval-like parse as JS object literal with vm.runInNewContext('(' + s + ')').
- 3) If still fails, run heuristic cleanups:
-    - remove lines that are only '*' or '***'
-    - quote unquoted keys like: key: value  -> "key": value
-    - wrap simple unquoted values in quotes when safe
-    - remove trailing commas
-*/
-const fs = require('fs'), vm = require('vm');
-const p = 'src/accounts.json';
-let s = fs.readFileSync(p, 'utf8');
-
-function tryJSONParse(str){
-  try { return {ok:true, val: JSON.parse(str)}; } catch(e) { return {ok:false, err:e}; }
-}
-
-let r = tryJSONParse(s);
-if (r.ok) {
-  console.log('Already valid JSON — no repair needed.');
-  process.exit(0);
-}
-console.log('Initial JSON parse failed:', r.err && r.err.message ? r.err.message : String(r.err));
-
-// Attempt 1: parse as JS object literal safely via vm
-try {
-  const obj = vm.runInNewContext('(' + s + ')', {}, {timeout:1000});
-  fs.writeFileSync(p, JSON.stringify(obj, null, 2) + '\n');
-  console.log('Parsed input as JS object literal and converted to JSON.');
-  process.exit(0);
-} catch(e) {
-  console.log('JS object literal parse failed:', e && e.message ? e.message : String(e));
-}
-
-// Attempt 2: heuristic cleanup
-let t = s;
-
-// remove lines that are just sequences of stars or lines starting with '***' or lines that are only '***'
-t = t.replace(/^\s*\*+\s*$/mg, '');       // remove lines that are only stars
-t = t.replace(/^\s*\*{3,}.*$/mg, '');     // remove lines starting with ***
-t = t.replace(/^\s*\*\s*/mg, '');         // remove leading single star markers
-
-// quote unquoted object keys:  key:  -> "key":
-t = t.replace(/([{,]\s*)([A-Za-z0-9_@.-]+)\s*:/g, '$1"$2":');
-
-// wrap simple unquoted values (emails, words, numbers already handled) in quotes when they are unquoted non-JSON tokens
-t = t.replace(/:\s*([A-Za-z0-9_\-@.\/]+)\s*(,?)(\n|$)/g, ': "$1"$2$3');
-
-// remove trailing commas before closing } or ]
-t = t.replace(/,(\s*[}\]])/g, '$1');
-
-// attempt parse after heuristics
-let r2 = tryJSONParse(t);
-if (r2.ok) {
-  fs.writeFileSync(p, JSON.stringify(r2.val, null, 2) + '\n');
-  console.log('Heuristic repairs succeeded and file overwritten with JSON.');
-  process.exit(0);
-}
-
-console.error('All repair attempts failed. Showing diagnostics:');
-console.error('--- first 400 chars of original ---');
-console.error(s.slice(0,400));
-console.error('--- first 400 chars of attempted transformed ---');
-console.error(t.slice(0,400));
-process.exit(2);
-JS
-              node /tmp/repair_accounts.js || { echo "Node repair failed — please correct the secret to valid JSON and re-run."; echo "Final preview of src/accounts.json (first 200 chars):"; head -c 200 src/accounts.json || true; exit 1; }
-              echo "After repair, preview (first 10 lines):"
-              sed -n '1,10p' src/accounts.json || true
+              echo "Invalid JSON according to jq. Please re-create the secret as base64 of valid JSON and try again."
+              sed -n '1,200p' src/accounts.json || true
+              exit 1
             fi
           else
-            # No jq present: fallback to node parse (same repair script)
-            echo "jq not found — attempting Node parse/repair (may be slower)."
-            cat > /tmp/repair_accounts.js <<'JS'
-const fs = require('fs'), vm = require('vm');
-const p = 'src/accounts.json';
-let s = fs.readFileSync(p, 'utf8');
-function tryJSONParse(str){ try { return {ok:true, val: JSON.parse(str)}; } catch(e) { return {ok:false, err:e}; } }
-let r = tryJSONParse(s);
-if (r.ok) { console.log('Already valid JSON — no repair needed.'); process.exit(0); }
-try {
-  const obj = vm.runInNewContext('(' + s + ')', {}, {timeout:1000});
-  fs.writeFileSync(p, JSON.stringify(obj, null, 2) + '\n');
-  console.log('Parsed input as JS object literal and converted to JSON.');
-  process.exit(0);
-} catch(e) {}
-let t = s;
-t = t.replace(/^\s*\*+\s*$/mg, '');
-t = t.replace(/^\s*\*{3,}.*$/mg, '');
-t = t.replace(/^\s*\*\s*/mg, '');
-t = t.replace(/([{,]\s*)([A-Za-z0-9_@.-]+)\s*:/g, '$1"$2":');
-t = t.replace(/:\s*([A-Za-z0-9_\-@.\/]+)\s*(,?)(\n|$)/g, ': "$1"$2$3');
-t = t.replace(/,(\s*[}\]])/g, '$1');
-let r2 = tryJSONParse(t);
-if (r2.ok) { fs.writeFileSync(p, JSON.stringify(r2.val, null, 2) + '\n'); console.log('Heuristic repairs succeeded and file overwritten with JSON.'); process.exit(0); }
-console.error('All repair attempts failed.'); console.error(s.slice(0,400)); process.exit(2);
-JS
-            node /tmp/repair_accounts.js || { echo "Node repair failed — please correct the secret to valid JSON and re-run."; head -c 200 src/accounts.json || true; exit 1; }
-            echo "After repair, preview (first 10 lines):"
-            sed -n '1,10p' src/accounts.json || true
+            node -e "try{JSON.parse(require('fs').readFileSync('src/accounts.json','utf8')); console.log('json ok')}catch(e){console.error('Invalid JSON:', e.message); process.exit(2)}"
           fi
 
-      - name: "Write & validate src/config.json if provided (supports base64 or raw secret)"
+      - name: Write src/config.json from base64 secret and validate (optional)
         shell: bash
         run: |
           set -euo pipefail
+          mkdir -p src
           if [ -n "${{ secrets.CONFIG_JSON_B64 }}" ]; then
-            echo "Using CONFIG_JSON_B64 (recommended)"
-            printf '%s' "${{ secrets.CONFIG_JSON_B64 }}" | base64 --decode > src/config.json || { echo "ERROR: base64 decode for CONFIG_JSON failed"; exit 1; }
-            echo "wrote src/config.json - size: $(wc -c < src/config.json) bytes"
+            echo "Decoding CONFIG_JSON_B64 -> src/config.json"
+            printf '%s' "${{ secrets.CONFIG_JSON_B64 }}" | base64 --decode > src/config.json
+            echo "Wrote src/config.json (size: $(wc -c < src/config.json) bytes). Preview first 6 lines:"
+            sed -n '1,6p' src/config.json || true
             if command -v jq >/dev/null 2>&1; then
-              jq . src/config.json >/dev/null || { echo "Invalid JSON in src/config.json (jq parse failed)"; sed -n '1,200p' src/config.json; exit 1; }
+              jq . src/config.json >/dev/null 2>&1 || (echo "Invalid JSON in CONFIG_JSON_B64"; sed -n '1,200p' src/config.json || true; exit 1)
             else
-              node -e "try{JSON.parse(require('fs').readFileSync('src/config.json','utf8')); console.log('config json ok')}catch(e){console.error('invalid json:', e.message); process.exit(2)}"
+              node -e "try{JSON.parse(require('fs').readFileSync('src/config.json','utf8')); console.log('config json ok')}catch(e){console.error('Invalid JSON:', e.message); process.exit(2)}"
             fi
           elif [ -n "${{ secrets.CONFIG_JSON }}" ]; then
-            echo "Using raw CONFIG_JSON secret (falling back)"
+            echo "Using raw CONFIG_JSON fallback (fragile)"
             RAW="${{ secrets.CONFIG_JSON }}"
             RAW="${RAW#\"}"; RAW="${RAW%\"}"
             RAW="${RAW#\'}"; RAW="${RAW%\'}"
             printf '%s' "$RAW" > src/config.json
-            echo "wrote src/config.json - size: $(wc -c < src/config.json) bytes"
-            if command -v jq >/dev/null 2>&1; then
-              jq . src/config.json >/dev/null || { echo "Invalid JSON in src/config.json (jq parse failed)"; sed -n '1,200p' src/config.json; exit 1; }
-            else
-              node -e "try{JSON.parse(require('fs').readFileSync('src/config.json','utf8')); console.log('config json ok')}catch(e){console.error('invalid json:', e.message); process.exit(2)}"
-            fi
+            echo "Wrote src/config.json (size: $(wc -c < src/config.json) bytes)."
           else
-            echo "CONFIG_JSON not provided; using repo config.json if present."
+            echo "No CONFIG_JSON provided; using repo config.json if present."
           fi
 
-      - name: "Install OS packages required by browsers (Playwright) (robust)"
+      - name: Install OS packages required by browsers (Playwright) (robust)
         shell: bash
         run: |
           set -euo pipefail
           echo "Updating apt..."
           sudo apt-get update -y
           BASE_PKGS="libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libxss1 libxcomposite1 libxdamage1 libxrandr2 libgtk-3-0 libgbm1 ca-certificates fonts-liberation libappindicator3-1 libatspi2.0-0 lsb-release jq"
-          echo "Attempting to install system packages (with libasound2 fallback logic)..."
+          echo "Installing system packages (with libasound2 fallback logic)..."
           if sudo apt-get install -y $BASE_PKGS libasound2; then
             echo "Installed with libasound2"
           else
-            echo "libasound2 not available, trying libasound2t64..."
             if sudo apt-get install -y $BASE_PKGS libasound2t64; then
               echo "Installed with libasound2t64"
             else
-              echo "libasound2t64 not available, trying liboss4-salsa-asound2..."
               if sudo apt-get install -y $BASE_PKGS liboss4-salsa-asound2; then
                 echo "Installed with liboss4-salsa-asound2"
               else
@@ -272,14 +171,14 @@ JS
             fi
           fi
 
-      - name: "Install Node dependencies (clean)"
+      - name: Install Node dependencies (clean)
         shell: bash
         run: |
           npm ci
           echo "node: $(node -v); npm: $(npm -v)"
           npm ls --depth=0 || true
 
-      - name: "Verify TypeScript / install if missing"
+      - name: Verify TypeScript / install if missing
         shell: bash
         run: |
           if ! npx --no-install tsc --version >/dev/null 2>&1; then
@@ -290,13 +189,13 @@ JS
             npx tsc --version || true
           fi
 
-      - name: "Create tsconfig.ci.json (exclude src/accounts.json) for CI"
+      - name: Create tsconfig.ci.json (exclude src/accounts.json) for CI
         shell: bash
         run: |
           set -euo pipefail
           if [ -f tsconfig.json ] && command -v jq >/dev/null 2>&1; then
             jq '(.exclude //= []) | .exclude |= (.+["src/accounts.json"] | unique)' tsconfig.json > tsconfig.ci.json
-            echo "Wrote tsconfig.ci.json (tsconfig.json copy with src/accounts.json excluded)"
+            echo "Wrote tsconfig.ci.json (tsconfig.json copy with src/accounts.json excluded)."
             head -c 320 tsconfig.ci.json || true
           else
             if [ ! -f tsconfig.json ]; then
@@ -306,19 +205,19 @@ JS
             fi
           fi
 
-      - name: "Optional: Run tsc --noEmit as a quick pre-check (using tsconfig.ci.json if present)"
+      - name: Optional: Run tsc --noEmit as a quick pre-check (using tsconfig.ci.json if present)
         shell: bash
         run: |
           if npx --no-install tsc --version >/dev/null 2>&1; then
             if [ -f tsconfig.ci.json ]; then
-              echo "Running tsc --noEmit -p tsconfig.ci.json to check compilation..."
+              echo "Running tsc --noEmit -p tsconfig.ci.json ..."
               npx tsc --noEmit -p tsconfig.ci.json || { echo "tsc (ci) failed; see output"; exit 1; }
             else
-              echo "Running tsc --noEmit (tsconfig.ci.json not present)..."
+              echo "Running tsc --noEmit ..."
               npx tsc --noEmit || { echo "tsc failed; see output"; exit 1; }
             fi
           else
-            echo "TypeScript not installed yet; installing temporarily for check..."
+            echo "TypeScript not installed; installing temporarily..."
             npm i -D typescript@latest
             if [ -f tsconfig.ci.json ]; then
               npx tsc --noEmit -p tsconfig.ci.json || { echo "tsc (ci) failed; see output"; exit 1; }
@@ -327,7 +226,7 @@ JS
             fi
           fi
 
-      - name: "Install Playwright OS deps helper (optional) and browsers"
+      - name: Install Playwright OS deps helper (optional) and browsers
         shell: bash
         run: |
           if command -v npx >/dev/null 2>&1; then
@@ -337,7 +236,7 @@ JS
           echo "Installing Playwright Chromium (with deps)..."
           npx playwright install --with-deps chromium
 
-      - name: "Build the project (per README) (use tsconfig.ci.json if present)"
+      - name: Build the project (per README) (use tsconfig.ci.json if present)
         shell: bash
         run: |
           if [ -f tsconfig.ci.json ]; then
@@ -348,14 +247,14 @@ JS
             npm run build
           fi
 
-      - name: "Run the built script and save logs"
+      - name: Run the built script and save logs
         shell: bash
         run: |
           mkdir -p logs
           npm run start 2>&1 | tee logs/script.log || true
           echo "Captured logs to logs/script.log"
 
-      - name: "Upload logs artifact"
+      - name: Upload logs artifact
         uses: actions/upload-artifact@v4
         with:
           name: microsoft-rewards-logs-${{ github.run_id }}
