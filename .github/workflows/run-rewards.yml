@@ -66,23 +66,61 @@ jobs:
           echo "Sleeping for ${JITTER_MIN} minute(s) (Toronto local jitter)"
           sleep $((JITTER_MIN * 60))
 
-      - name: "Create src/accounts.json from secret"
+      - name: "Write & validate src/accounts.json (supports base64 or raw secret)"
         shell: bash
         run: |
+          set -euo pipefail
           mkdir -p src
-          if [ -z "${{ secrets.ACCOUNTS_JSON }}" ]; then
-            echo "ERROR: ACCOUNTS_JSON secret is empty. Add your src/accounts.json content to the secret named ACCOUNTS_JSON."
+
+          if [ -n "${{ secrets.ACCOUNTS_JSON_B64 }}" ]; then
+            echo "Using ACCOUNTS_JSON_B64 (recommended)"
+            printf '%s' "${{ secrets.ACCOUNTS_JSON_B64 }}" | base64 --decode > src/accounts.json || { echo "ERROR: base64 decode failed"; exit 1; }
+          elif [ -n "${{ secrets.ACCOUNTS_JSON }}" ]; then
+            echo "Using raw ACCOUNTS_JSON secret (falling back)"
+            RAW="${{ secrets.ACCOUNTS_JSON }}"
+            RAW="${RAW#\"}"; RAW="${RAW%\"}"
+            RAW="${RAW#\'}"; RAW="${RAW%\'}"
+            printf '%s' "$RAW" > src/accounts.json
+          else
+            echo "ERROR: Neither ACCOUNTS_JSON_B64 nor ACCOUNTS_JSON secret present"
             exit 1
           fi
-          printf '%s' "${{ secrets.ACCOUNTS_JSON }}" > src/accounts.json
-          echo "wrote src/accounts.json - size: $(wc -c < src/accounts.json) bytes"
 
-      - name: "Create src/config.json from secret if provided"
+          echo "wrote src/accounts.json - size: $(wc -c < src/accounts.json) bytes"
+          echo "First 3 lines for quick sanity (non-sensitive):"
+          sed -n '1,3p' src/accounts.json || true
+
+          if command -v jq >/dev/null 2>&1; then
+            jq . src/accounts.json >/dev/null || { echo "Invalid JSON in src/accounts.json (jq parse failed)"; sed -n '1,200p' src/accounts.json; exit 1; }
+          else
+            node -e "try{JSON.parse(require('fs').readFileSync('src/accounts.json','utf8')); console.log('json ok')}catch(e){console.error('invalid json:', e.message); process.exit(2)}"
+          fi
+
+      - name: "Write & validate src/config.json if provided (supports base64 or raw secret)"
         shell: bash
         run: |
-          if [ -n "${{ secrets.CONFIG_JSON }}" ]; then
-            printf '%s' "${{ secrets.CONFIG_JSON }}" > src/config.json
+          set -euo pipefail
+          if [ -n "${{ secrets.CONFIG_JSON_B64 }}" ]; then
+            echo "Using CONFIG_JSON_B64 (recommended)"
+            printf '%s' "${{ secrets.CONFIG_JSON_B64 }}" | base64 --decode > src/config.json || { echo "ERROR: base64 decode for CONFIG_JSON failed"; exit 1; }
             echo "wrote src/config.json - size: $(wc -c < src/config.json) bytes"
+            if command -v jq >/dev/null 2>&1; then
+              jq . src/config.json >/dev/null || { echo "Invalid JSON in src/config.json (jq parse failed)"; sed -n '1,200p' src/config.json; exit 1; }
+            else
+              node -e "try{JSON.parse(require('fs').readFileSync('src/config.json','utf8')); console.log('config json ok')}catch(e){console.error('invalid json:', e.message); process.exit(2)}"
+            fi
+          elif [ -n "${{ secrets.CONFIG_JSON }}" ]; then
+            echo "Using raw CONFIG_JSON secret (falling back)"
+            RAW="${{ secrets.CONFIG_JSON }}"
+            RAW="${RAW#\"}"; RAW="${RAW%\"}"
+            RAW="${RAW#\'}"; RAW="${RAW%\'}"
+            printf '%s' "$RAW" > src/config.json
+            echo "wrote src/config.json - size: $(wc -c < src/config.json) bytes"
+            if command -v jq >/dev/null 2>&1; then
+              jq . src/config.json >/dev/null || { echo "Invalid JSON in src/config.json (jq parse failed)"; sed -n '1,200p' src/config.json; exit 1; }
+            else
+              node -e "try{JSON.parse(require('fs').readFileSync('src/config.json','utf8')); console.log('config json ok')}catch(e){console.error('invalid json:', e.message); process.exit(2)}"
+            fi
           else
             echo "CONFIG_JSON not provided; using repo config.json if present."
           fi
@@ -95,7 +133,6 @@ jobs:
           echo "Updating apt..."
           sudo apt-get update -y
 
-          # base list (without libasound2 which may be renamed on ubuntu 24.04)
           BASE_PKGS="libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 libxss1 libxcomposite1 libxdamage1 libxrandr2 libgtk-3-0 libgbm1 ca-certificates fonts-liberation libappindicator3-1 libatspi2.0-0 lsb-release"
 
           echo "Attempting to install system packages (with libasound2 fallback logic)..."
@@ -135,14 +172,42 @@ jobs:
             npx tsc --version || true
           fi
 
+      - name: "Ensure tsconfig excludes runtime-only JSON files (src/accounts.json)"
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f tsconfig.json ]; then
+            node -e "
+const fs=require('fs'),p='tsconfig.json';
+let cfg=JSON.parse(fs.readFileSync(p,'utf8'));
+if(!Array.isArray(cfg.exclude)) cfg.exclude=[];
+if(!cfg.exclude.includes('src/accounts.json')){
+  cfg.exclude.push('src/accounts.json');
+  fs.writeFileSync(p,JSON.stringify(cfg,null,2)+'\n');
+  console.log('Added src/accounts.json to tsconfig.json exclude');
+} else console.log('tsconfig.json already excludes src/accounts.json');
+"
+          else
+            echo "No tsconfig.json found; skipping tsconfig patch."
+          fi
+
+      - name: "Optional: Run tsc --noEmit as a quick pre-check"
+        shell: bash
+        run: |
+          if npx --no-install tsc --version >/dev/null 2>&1; then
+            echo "Running tsc --noEmit to check compilation (excludes should be in effect)..."
+            npx tsc --noEmit || { echo "tsc failed; see output"; exit 1; }
+          else
+            echo "TypeScript not installed yet; installing temporarily for check..."
+            npm i -D typescript@latest
+            npx tsc --noEmit || { echo "tsc failed; see output"; exit 1; }
+          fi
+
       - name: "Install Playwright OS deps helper (optional) and browsers"
         shell: bash
         run: |
-          # Optional helper that attempts to install needed OS deps for Playwright on Debian/Ubuntu.
-          # This is complementary; the robust apt step above should handle the main issue.
           if command -v npx >/dev/null 2>&1; then
             echo "Running npx playwright install-deps (may require sudo)..."
-            # allow this to fail non-fatally on images where the helper isn't supported
             npx playwright install-deps || true
           fi
 
