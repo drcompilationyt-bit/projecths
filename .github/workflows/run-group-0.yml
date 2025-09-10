@@ -139,7 +139,7 @@ jobs:
           fi
 
           if command -v jq >/dev/null 2>&1; then
-            jq . src/accounts.json >/dev/null || { echo "Invalid JSON in src/accounts.json" >&2; exit 1; }
+            jq . src.accounts.json >/dev/null || { echo "Invalid JSON in src.accounts.json" >&2; exit 1; }
             echo "src/accounts.json validated by jq"
           else
             node -e "try{JSON.parse(require('fs').readFileSync('src/accounts.json','utf8')); console.log('validated')}catch(e){ console.error('Invalid JSON:', e.message); process.exit(2) }"
@@ -186,9 +186,24 @@ jobs:
           const mySize = groupSizes[jobIndex] || 0;
           const slice = arr.slice(start, start + mySize);
           fs.writeFileSync('dist/accounts.json', JSON.stringify(slice, null, 2));
-          console.log('SeedDate:', seedDate, 'Assigned', slice.length, 'accounts to job', jobIndex);
+          console.log('SeedDate:', seedDate, 'jobIndex:', jobIndex, 'groupSizes:', groupSizes, 'start:', start, 'mySize:', mySize, 'totalAccounts:', all.length, 'Assigned', slice.length, 'accounts to job', jobIndex);
           JS
           node dist/slice.js
+
+      - name: Propagate slice to src (so build & runtime use the same accounts)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f dist/accounts.json ]; then
+            cp dist/accounts.json src/accounts.json
+            echo "Copied dist/accounts.json -> src/accounts.json"
+            echo "Assigned accounts (first 40 lines):"
+            head -n 40 dist/accounts.json || true
+          else
+            echo "ERROR: dist/accounts.json missing after slice step" >&2
+            ls -la dist || true
+            exit 1
+          fi
 
       - name: Upload assigned dist/accounts.json for debug
         if: always()
@@ -233,7 +248,7 @@ jobs:
           if [ -f dist/accounts.json ]; then
             echo "dist/accounts.json present"
           elif [ -f src/accounts.json ]; then
-            cp src/accounts.json dist/accounts.json
+            cp src.accounts.json dist/accounts.json
             echo "Copied src/accounts.json -> dist/accounts.json"
           else
             echo "WARNING: src/accounts.json missing — job may fail." >&2
