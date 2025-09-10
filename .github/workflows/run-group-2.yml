@@ -98,7 +98,7 @@ jobs:
                 if printf '%s' "$RAW" | base64 --decode > "$TMP" 2>/dev/null; then
                   if command -v jq >/dev/null 2>&1; then
                     if jq . "$TMP" >/dev/null 2>&1; then
-                      mv "$TMP" src.accounts.json
+                      mv "$TMP" src/accounts.json
                       echo "Decoded base64 -> src/accounts.json (validated jq)"
                     else
                       rm -f "$TMP"
@@ -107,7 +107,7 @@ jobs:
                     fi
                   else
                     if node -e "try{JSON.parse(require('fs').readFileSync('$TMP','utf8')); process.exit(0)}catch(e){ process.exit(2) }"; then
-                      mv "$TMP" src.accounts.json
+                      mv "$TMP" src/accounts.json
                       echo "Decoded base64 -> src/accounts.json (validated node)"
                     else
                       rm -f "$TMP"
@@ -125,9 +125,9 @@ jobs:
           else
             echo "No ACCOUNTS_JSON; trying example fallback"
             if [ -f src/accounts.example.json ]; then
-              cp src/accounts.example.json src.accounts.json
+              cp src/accounts.example.json src/accounts.json
             elif [ -f accounts.example.json ]; then
-              cp accounts.example.json src.accounts.json
+              cp accounts.example.json src/accounts.json
             else
               echo "ERROR: No accounts secret and no example file" >&2
               ls -la || true
@@ -136,7 +136,7 @@ jobs:
           fi
 
           if command -v jq >/dev/null 2>&1; then
-            jq . src.accounts.json >/dev/null || { echo "Invalid JSON in src.accounts.json" >&2; exit 1; }
+            jq . src/accounts.json >/dev/null || { echo "Invalid JSON in src/accounts.json" >&2; exit 1; }
             echo "src/accounts.json validated by jq"
           else
             node -e "try{JSON.parse(require('fs').readFileSync('src/accounts.json','utf8')); console.log('validated')}catch(e){ console.error('Invalid JSON:', e.message); process.exit(2) }"
@@ -230,8 +230,8 @@ jobs:
           if [ -f dist/accounts.json ]; then
             echo "dist/accounts.json present"
           elif [ -f src/accounts.json ]; then
-            cp src.accounts.json dist.accounts.json
-            echo "Copied src/accounts.json -> dist.accounts.json"
+            cp src/accounts.json dist/accounts.json
+            echo "Copied src/accounts.json -> dist/accounts.json"
           else
             echo "WARNING: src/accounts.json missing — job may fail." >&2
             ls -la src || true
