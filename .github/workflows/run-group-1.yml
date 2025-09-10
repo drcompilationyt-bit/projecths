@@ -20,7 +20,7 @@ jobs:
       JOB_INDEX: '1'
       GROUP_SIZES: '3,2,2'
       TARGET_HOUR_TORONTO: '11'
-      MAX_JITTER_SECONDS: '8280'
+      MAX_JITTER_SECONDS: '8280' # 2.3 hours
 
     steps:
       - name: Checkout repo
@@ -64,7 +64,7 @@ jobs:
             sleep "$JITTER_SEC"
           fi
 
-      - name: Write src/accounts.json from secret (robust + debug)
+      - name: Write src/accounts.json from secret (robust + validate)
         shell: bash
         env:
           ACCOUNTS_JSON_B64: ${{ secrets.ACCOUNTS_JSON_B64 || '' }}
@@ -76,8 +76,9 @@ jobs:
           ls -la
 
           if [ -n "${ACCOUNTS_JSON_B64:-}" ]; then
+            echo "Decoding ACCOUNTS_JSON_B64 -> src/accounts.json"
             if printf '%s' "$ACCOUNTS_JSON_B64" | base64 --decode > src/accounts.json 2>/dev/null; then
-              echo "Decoded ACCOUNTS_JSON_B64 -> src/accounts.json"
+              echo "Decoded to src/accounts.json"
             else
               echo "ERROR decoding ACCOUNTS_JSON_B64" >&2
               exit 1
@@ -123,7 +124,7 @@ jobs:
                 ;;
             esac
           else
-            echo "No ACCOUNTS_JSON; trying example fallback"
+            echo "No ACCOUNTS_JSON provided; attempting example fallback"
             if [ -f src/accounts.example.json ]; then
               cp src/accounts.example.json src/accounts.json
             elif [ -f accounts.example.json ]; then
@@ -136,7 +137,7 @@ jobs:
           fi
 
           if command -v jq >/dev/null 2>&1; then
-            jq . src.accounts.json >/dev/null || { echo "Invalid JSON in src/accounts.json" >&2; exit 1; }
+            jq . src/accounts.json >/dev/null || { echo "Invalid JSON in src/accounts.json" >&2; exit 1; }
             echo "src/accounts.json validated by jq"
           else
             node -e "try{JSON.parse(require('fs').readFileSync('src/accounts.json','utf8')); console.log('validated')}catch(e){ console.error('Invalid JSON:', e.message); process.exit(2) }"
@@ -155,6 +156,7 @@ jobs:
           const jobIndex = Number(process.env.JOB_INDEX || '1');
           const groupSizes = (process.env.GROUP_SIZES || '3,2,2').split(',').map(Number);
           const seedDate = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Toronto' });
+
           function seedFromString(s){
             let h = 2166136261 >>> 0;
             for (let i = 0; i < s.length; i++) {
@@ -170,6 +172,7 @@ jobs:
               return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
             }
           }
+
           const rng = mulberry32(seedFromString(seedDate));
           const arr = all.slice();
           for (let i = arr.length - 1; i > 0; i--) {
@@ -185,7 +188,7 @@ jobs:
           JS
           node dist/slice.js
 
-      - name: Propagate slice, mask summary (so build & runtime use the same accounts but we never print secrets)
+      - name: Propagate slice, mask summary (so build & runtime use the same accounts but never print secrets)
         shell: bash
         run: |
           set -euo pipefail
@@ -194,7 +197,10 @@ jobs:
           const src = 'dist/accounts.json';
           if (!fs.existsSync(src)) { console.error('dist/accounts.json not found'); process.exit(1); }
           const arr = JSON.parse(fs.readFileSync(src,'utf8') || '[]');
+
+          // copy slice into src for build/runtime
           fs.writeFileSync('src/accounts.json', JSON.stringify(arr, null, 2));
+
           function maskEmail(email){
             if(!email || typeof email !== 'string') return '(no-email)';
             const [local, domain] = email.split('@');
@@ -204,15 +210,21 @@ jobs:
             const middleMask = local.length <= 3 ? '***' : '****';
             return `${first}${middleMask}${last}@${domain}`;
           }
+
           const summary = arr.map((a, idx) => {
             const email = a.email || a.username || a.user || '';
             const id = a.id || a.name || a.username || null;
             return { index: idx, id: id || null, email: email ? maskEmail(email) : '(no-email)' };
           });
+
+          // safe prints only
           console.log('Assigned account count:', summary.length);
           console.log('Masked accounts (first 10):', JSON.stringify(summary.slice(0,10), null, 2));
+
+          // write masked artifact for audit
           fs.writeFileSync('dist/assigned_masked_summary.json', JSON.stringify(summary, null, 2));
           NODE
+
           node dist/mask_and_copy.js
 
       - name: Upload assigned masked summary for debug
@@ -312,11 +324,16 @@ jobs:
           }
           function sanitizeContent(content){
             if(!content) return content;
+            // mask emails
             content = maskEmailStr(content);
+            // redact JSON-style password fields: "password": "..."
             content = content.replace(/("(?:(?:P|p)assword|pwd|pass)\"?\s*:\s*\")([^"]+)\"/g, '$1***REDACTED***"');
+            // redact password=... or Pass= ...
             content = content.replace(/(\b(?:(?:P|p)ass(?:word)?|pwd)\b\s*[:=]\s*)([^\\s,;]+)/g, '$1***REDACTED***');
+            // redact Authorization Bearer/Basic tokens
             content = content.replace(/(Authorization[:=]\s*)(Bearer|Basic)?\s*[A-Za-z0-9\-_.=]+/gi, '$1$2 ***REDACTED***');
             content = content.replace(/(Bearer|Basic)\s+[A-Za-z0-9\-_.=]+/gi, '$1 ***REDACTED***');
+            // redact long base64/blobs
             content = content.replace(/\b[A-Za-z0-9+\/]{40,}={0,2}\b/g, '***REDACTED_BASE64***');
             return content;
           }
@@ -329,12 +346,21 @@ jobs:
             const rawEnv = fs.readFileSync(envPath, 'utf8');
             fs.writeFileSync(envPath, sanitizeContent(rawEnv), 'utf8');
           }
+          // also produce a tarball of logs (sanitized) to upload
+          const { execSync } = require('child_process');
+          try {
+            execSync('tar -czf logs-full.tar.gz logs', { stdio: 'ignore' });
+          } catch (e) { /* ignore */ }
           console.log('Logs sanitized (emails masked, tokens/passwords redacted).');
           NODE
 
           node dist/sanitize_logs.js || true
+
+          # fallback sed redaction for any leftover patterns
           sed -E -i 's/("password"[[:space:]]*:[[:space:]]*)"[^"]*"/\1"***REDACTED***"/Ig' logs/script.log || true
           sed -E -i 's/([Pp]ass(word)?[[:space:]]*[:=][[:space:]]*)[^[:space:],;]+/\1***REDACTED***/g' logs/script.log || true
+          sed -E -i 's/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/***REDACTED_EMAIL***/g' logs/script.log || true
+          sed -E -i 's/[A-Za-z0-9+\/]{40,}={0,2}/***REDACTED_BASE64***/g' logs/script.log || true
 
       - name: Upload logs (artifact)
         if: always()
