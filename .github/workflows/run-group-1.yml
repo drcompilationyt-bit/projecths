@@ -17,9 +17,9 @@ jobs:
     env:
       NODE_VERSION: '20'
       SIMULATE_SCHEDULE: ${{ github.event.inputs.simulate_schedule || 'false' }}
-      JOB_INDEX: '1'            # this runner's partition index (1 => second slice)
-      GROUP_SIZES: '3,2,2'      # partition sizes
-      TARGET_HOUR_TORONTO: '11' # gate check (local hour)
+      JOB_INDEX: '1'
+      GROUP_SIZES: '3,2,2'
+      TARGET_HOUR_TORONTO: '11'
       MAX_JITTER_SECONDS: '8280' # 2.3 hours
 
     steps:
@@ -76,9 +76,8 @@ jobs:
           ls -la
 
           if [ -n "${ACCOUNTS_JSON_B64:-}" ]; then
-            echo "Decoding ACCOUNTS_JSON_B64"
             if printf '%s' "$ACCOUNTS_JSON_B64" | base64 --decode > src/accounts.json 2>/dev/null; then
-              echo "Decoded to src/accounts.json"
+              echo "Decoded ACCOUNTS_JSON_B64 -> src/accounts.json"
             else
               echo "ERROR decoding ACCOUNTS_JSON_B64" >&2
               exit 1
@@ -124,7 +123,7 @@ jobs:
                 ;;
             esac
           else
-            echo "No ACCOUNTS_JSON provided; attempting example fallback"
+            echo "No ACCOUNTS_JSON; trying example fallback"
             if [ -f src/accounts.example.json ]; then
               cp src/accounts.example.json src/accounts.json
             elif [ -f accounts.example.json ]; then
@@ -137,7 +136,7 @@ jobs:
           fi
 
           if command -v jq >/dev/null 2>&1; then
-            jq . src/accounts.json >/dev/null || { echo "Invalid JSON in src/accounts.json" >&2; exit 1; }
+            jq . src.accounts.json >/dev/null || { echo "Invalid JSON in src/accounts.json" >&2; exit 1; }
             echo "src/accounts.json validated by jq"
           else
             node -e "try{JSON.parse(require('fs').readFileSync('src/accounts.json','utf8')); console.log('validated')}catch(e){ console.error('Invalid JSON:', e.message); process.exit(2) }"
@@ -188,6 +187,21 @@ jobs:
           JS
           node dist/slice.js
 
+      - name: Propagate slice to src (so build & runtime use the same accounts)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f dist/accounts.json ]; then
+            cp dist/accounts.json src/accounts.json
+            echo "Copied dist/accounts.json -> src/accounts.json"
+            echo "Assigned accounts (first 40 lines):"
+            head -n 40 dist/accounts.json || true
+          else
+            echo "ERROR: dist/accounts.json missing after slice step" >&2
+            ls -la dist || true
+            exit 1
+          fi
+
       - name: Upload assigned dist/accounts.json for debug
         if: always()
         uses: actions/upload-artifact@v4
@@ -231,10 +245,10 @@ jobs:
           if [ -f dist/accounts.json ]; then
             echo "dist/accounts.json present"
           elif [ -f src/accounts.json ]; then
-            cp src.accounts.json dist/accounts.json
+            cp src/accounts.json dist/accounts.json
             echo "Copied src/accounts.json -> dist/accounts.json"
           else
-            echo "WARNING: src.accounts.json missing — job may fail." >&2
+            echo "WARNING: src/accounts.json missing — job may fail." >&2
             ls -la src || true
           fi
 
@@ -288,4 +302,3 @@ jobs:
           path: |
             logs-full.tar.gz
             logs/*
-
