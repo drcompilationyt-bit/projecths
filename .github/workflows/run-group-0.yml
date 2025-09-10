@@ -4,7 +4,6 @@ on:
   schedule:
     # 09:00 Toronto local -> 13:00 UTC (DST) and 14:00 UTC (standard)
     - cron: '0 13 * * *'
-    - cron: '0 14 * * *'
   workflow_dispatch:
     inputs:
       simulate_schedule:
