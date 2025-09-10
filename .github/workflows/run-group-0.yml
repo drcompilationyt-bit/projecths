@@ -1,8 +1,8 @@
-name: "Run Microsoft Rewards Script (randomized start around 08:00 Toronto local)"
+name: "Runner 1"
 
 on:
   schedule:
-    # 09:00 Toronto local --> 13:00 UTC (DST) and 14:00 UTC (standard)
+    # 09:00 Toronto local -> 13:00 UTC (DST) and 14:00 UTC (standard)
     - cron: '0 13 * * *'
     - cron: '0 14 * * *'
   workflow_dispatch:
@@ -145,7 +145,7 @@ jobs:
           fi
 
           if command -v jq >/dev/null 2>&1; then
-            jq . src/accounts.json >/dev/null || { echo "Invalid JSON in src/accounts.json" >&2; exit 1; }
+            jq . src.accounts.json >/dev/null || { echo "Invalid JSON in src/accounts.json" >&2; exit 1; }
             echo "src/accounts.json validated by jq."
           else
             node -e "try{JSON.parse(require('fs').readFileSync('src/accounts.json','utf8')); console.log('src/accounts.json validated by node')}catch(e){ console.error('Invalid JSON:', e.message); process.exit(2) }"
@@ -156,23 +156,26 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist
-          node - <<'NODE'
+          # Create slice JS program safely (avoids YAML parse issues)
+          cat > dist/slice.js <<'JS'
 const fs = require('fs');
-const all = JSON.parse(fs.readFileSync('src/accounts.json','utf8'));
-const jobIndex = Number(process.env.JOB_INDEX||'0');
-const groupSizes = (process.env.GROUP_SIZES||'3,2,2').split(',').map(Number);
-const seedDate = new Date().toLocaleDateString('en-CA',{ timeZone: 'America/Toronto' }); // YYYY-MM-DD
-function seedFromString(s){ let h=2166136261>>>0; for(let i=0;i<s.length;i++){ h=Math.imul(h ^ s.charCodeAt(i),16777619)>>>0;} return h>>>0; }
+const all = JSON.parse(fs.readFileSync('src/accounts.json','utf8') || '[]');
+const jobIndex = Number(process.env.JOB_INDEX || '0');
+const groupSizes = (process.env.GROUP_SIZES || '3,2,2').split(',').map(Number);
+const seedDate = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Toronto' }); // YYYY-MM-DD
+function seedFromString(s){ let h = 2166136261 >>> 0; for(let i=0;i<s.length;i++){ h = Math.imul(h ^ s.charCodeAt(i), 16777619) >>> 0; } return h >>> 0; }
 function mulberry32(a){ return function(){ let t = a += 0x6D2B79F5; t = Math.imul(t ^ (t >>> 15), t | 1); t ^= t + Math.imul(t ^ (t >>> 7), t | 61); return ((t ^ (t >>> 14)) >>> 0) / 4294967296; } }
 const rng = mulberry32(seedFromString(seedDate));
 const arr = all.slice();
-for(let i=arr.length-1;i>0;i--){ const j=Math.floor(rng()*(i+1)); [arr[i],arr[j]]=[arr[j],arr[i]]; }
-let start=0; for(let i=0;i<jobIndex;i++) start += (groupSizes[i]||0);
-const mySize = groupSizes[jobIndex]||0;
-const slice = arr.slice(start, start+mySize);
+for (let i = arr.length - 1; i > 0; i--) { const j = Math.floor(rng() * (i + 1)); [arr[i], arr[j]] = [arr[j], arr[i]]; }
+let start = 0;
+for (let i = 0; i < jobIndex; i++) start += (groupSizes[i] || 0);
+const mySize = groupSizes[jobIndex] || 0;
+const slice = arr.slice(start, start + mySize);
 fs.writeFileSync('dist/accounts.json', JSON.stringify(slice, null, 2));
 console.log('SeedDate:', seedDate, 'Assigned', slice.length, 'accounts to job', jobIndex);
-NODE
+JS
+          node dist/slice.js
 
       - name: "Install Node dependencies (npm ci)"
         run: npm ci --no-audit --no-fund
@@ -233,7 +236,6 @@ if (typeof globalThis.File === 'undefined') {
   };
 }
 EOF
-          echo "Wrote dist/polyfill-file.js"
 
       - name: "Run the built script under Xvfb (headed allowed) and save logs"
         shell: bash
@@ -242,7 +244,6 @@ EOF
           mkdir -p logs
           xvfb-run --auto-servernum --server-args='-screen 0 1280x1024x24' \
             sh -c "stdbuf -oL -eL node -r ./dist/polyfill-file.js ./dist/index.js 2>&1 | tee -a logs/script.log" || true
-          echo "Captured logs to logs/script.log"
           ps auxww > logs/ps-auxww.txt || true
           ls -laR > logs/ls-laR.txt || true
           env > logs/env.raw || true
@@ -259,6 +260,7 @@ EOF
           sed -E -i 's/[A-Za-z0-9+/]{40,}={0,2}/***REDACTED_BASE64***/g' logs/script.log || true
           cp logs/env.raw logs/env.raw.bak || true
           sed -E -i 's/([A-Za-z0-9_]+)=([^[:space:]]+)/\1=***REDACTED_ENV***/g' logs/env.raw || true
+          tar -czf logs-full.tar.gz logs || true
 
       - name: "Upload logs"
         if: always()
@@ -266,6 +268,5 @@ EOF
         with:
           name: microsoft-rewards-logs-${{ github.run_id }}-group0
           path: |
-            logs/script.log
             logs-full.tar.gz
             logs/*
