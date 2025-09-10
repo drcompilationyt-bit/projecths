@@ -136,7 +136,7 @@ jobs:
           fi
 
           if command -v jq >/dev/null 2>&1; then
-            jq . src/accounts.json >/dev/null || { echo "Invalid JSON in src/accounts.json" >&2; exit 1; }
+            jq . src.accounts.json >/dev/null || { echo "Invalid JSON in src.accounts.json" >&2; exit 1; }
             echo "src/accounts.json validated by jq"
           else
             node -e "try{JSON.parse(require('fs').readFileSync('src/accounts.json','utf8')); console.log('validated')}catch(e){ console.error('Invalid JSON:', e.message); process.exit(2) }"
@@ -155,7 +155,7 @@ jobs:
           const jobIndex = Number(process.env.JOB_INDEX || '2');
           const groupSizes = (process.env.GROUP_SIZES || '3,2,2').split(',').map(Number);
           const seedDate = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Toronto' });
-          
+
           function seedFromString(s){
             let h = 2166136261 >>> 0;
             for (let i = 0; i < s.length; i++) {
@@ -171,7 +171,7 @@ jobs:
               return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
             }
           }
-          
+
           const rng = mulberry32(seedFromString(seedDate));
           const arr = all.slice();
           for (let i = arr.length - 1; i > 0; i--) {
@@ -183,9 +183,24 @@ jobs:
           const mySize = groupSizes[jobIndex] || 0;
           const slice = arr.slice(start, start + mySize);
           fs.writeFileSync('dist/accounts.json', JSON.stringify(slice, null, 2));
-          console.log('SeedDate:', seedDate, 'Assigned', slice.length, 'accounts to job', jobIndex);
+          console.log('SeedDate:', seedDate, 'jobIndex:', jobIndex, 'groupSizes:', groupSizes, 'start:', start, 'mySize:', mySize, 'totalAccounts:', all.length, 'Assigned', slice.length, 'accounts to job', jobIndex);
           JS
           node dist/slice.js
+
+      - name: Propagate slice to src (so build & runtime use the same accounts)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f dist/accounts.json ]; then
+            cp dist/accounts.json src/accounts.json
+            echo "Copied dist/accounts.json -> src/accounts.json"
+            echo "Assigned accounts (first 40 lines):"
+            head -n 40 dist/accounts.json || true
+          else
+            echo "ERROR: dist/accounts.json missing after slice step" >&2
+            ls -la dist || true
+            exit 1
+          fi
 
       - name: Upload assigned dist/accounts.json for debug
         if: always()
@@ -272,8 +287,8 @@ jobs:
           cp logs/script.log logs/script.log.raw || true
           sed -E -i 's/("password"[[:space:]]*:[[:space:]]*)"[^"]*"/\1"***REDACTED***"/Ig' logs/script.log || true
           sed -E -i 's/([Pp]ass(word)?[[:space:]]*[:=][[:space:]]*)[^[:space:],;]+/\1***REDACTED***/g' logs/script.log || true
-          sed -E -i 's/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/***REDACTED_EMAIL***/g' logs/script.log || true
-          sed -E -i 's/([Aa]uthorization[[:space:]]*[:=][[:space:]]*(Bearer|Basic)?[[:space:]]*)[^[:space:]]+/\1***REDACTED***/g' logs/script.log || true
+          sed -E -i 's/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/***REDACTED_EMAIL***/g' logs.script.log || true
+          sed -E -i 's/([Aa]uthorization[[:space:]]*[:=][[:space:]]*(Bearer|Basic)?[[:space:]]*)[^[:space:]]+/\1***REDACTED***/g' logs.script.log || true
           sed -E -i 's/[A-Za-z0-9+/]{40,}={0,2}/***REDACTED_BASE64***/g' logs/script.log || true
           cp logs/env.raw logs/env.raw.bak || true
           sed -E -i 's/([A-Za-z0-9_]+)=([^[:space:]]+)/\1=***REDACTED_ENV***/g' logs/env.raw || true
