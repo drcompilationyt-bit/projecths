@@ -2,8 +2,8 @@ name: "runner1"
 
 on:
   schedule:
-    # 09:00 Toronto local -> 13:00 UTC (DST) and 14:00 UTC (standard)
     - cron: '0 13 * * *'
+    - cron: '0 14 * * *'
   workflow_dispatch:
     inputs:
       simulate_schedule:
@@ -18,10 +18,10 @@ jobs:
     env:
       NODE_VERSION: '20'
       SIMULATE_SCHEDULE: ${{ github.event.inputs.simulate_schedule || 'false' }}
-      JOB_INDEX: '0'            # this runner's partition index (0 => first slice)
-      GROUP_SIZES: '3,2,2'      # partition sizes
-      TARGET_HOUR_TORONTO: '9'  # gate check (local hour)
-      MAX_JITTER_SECONDS: '4320' # 1.2 hours
+      JOB_INDEX: '0'
+      GROUP_SIZES: '3,2,2'
+      TARGET_HOUR_TORONTO: '9'
+      MAX_JITTER_SECONDS: '4320'
 
     steps:
       - name: Checkout repo
@@ -138,7 +138,7 @@ jobs:
           fi
 
           if command -v jq >/dev/null 2>&1; then
-            jq . src.accounts.json >/dev/null || { echo "Invalid JSON in src.accounts.json" >&2; exit 1; }
+            jq . src/accounts.json >/dev/null || { echo "Invalid JSON in src/accounts.json" >&2; exit 1; }
             echo "src/accounts.json validated by jq"
           else
             node -e "try{JSON.parse(require('fs').readFileSync('src/accounts.json','utf8')); console.log('validated')}catch(e){ console.error('Invalid JSON:', e.message); process.exit(2) }"
@@ -157,7 +157,7 @@ jobs:
           const jobIndex = Number(process.env.JOB_INDEX || '0');
           const groupSizes = (process.env.GROUP_SIZES || '3,2,2').split(',').map(Number);
           const seedDate = new Date().toLocaleDateString('en-CA', { timeZone: 'America/Toronto' });
-          
+
           function seedFromString(s){
             let h = 2166136261 >>> 0;
             for (let i = 0; i < s.length; i++) {
@@ -173,7 +173,7 @@ jobs:
               return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
             }
           }
-          
+
           const rng = mulberry32(seedFromString(seedDate));
           const arr = all.slice();
           for (let i = arr.length - 1; i > 0; i--) {
@@ -247,7 +247,7 @@ jobs:
           if [ -f dist/accounts.json ]; then
             echo "dist/accounts.json present"
           elif [ -f src/accounts.json ]; then
-            cp src.accounts.json dist/accounts.json
+            cp src/accounts.json dist/accounts.json
             echo "Copied src/accounts.json -> dist/accounts.json"
           else
             echo "WARNING: src/accounts.json missing — job may fail." >&2
@@ -293,7 +293,7 @@ jobs:
           sed -E -i 's/([Aa]uthorization[[:space:]]*[:=][[:space:]]*(Bearer|Basic)?[[:space:]]*)[^[:space:]]+/\1***REDACTED***/g' logs/script.log || true
           sed -E -i 's/[A-Za-z0-9+/]{40,}={0,2}/***REDACTED_BASE64***/g' logs/script.log || true
           cp logs/env.raw logs/env.raw.bak || true
-          sed -E -i 's/([A-Za-z0-9_]+)=([^[:space:]]+)/\1=***REDACTED_ENV***/g' logs/env.raw || true
+          sed -E -i 's/([A-Za-z0-9_]+)=([^[:space:]]+)/\1=***REDACTED_ENV***/g' logs.env.raw || true || true
           tar -czf logs-full.tar.gz logs || true
 
       - name: Upload logs (artifact)
