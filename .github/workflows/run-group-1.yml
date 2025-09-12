@@ -20,7 +20,7 @@ jobs:
       JOB_INDEX: '1'
       GROUP_SIZES: '3,2,2'
       TARGET_HOUR_TORONTO: '11'
-      MAX_JITTER_SECONDS: '8280' # 2.3 hours
+      MAX_JITTER_SECONDS: '2400' # 2.3 hours
 
     steps:
       - name: Checkout repo
@@ -58,7 +58,7 @@ jobs:
             echo "Manual run — skipping jitter."
             JITTER_SEC=0
           else
-            MAX=${MAX_JITTER_SECONDS:-8280}
+            MAX=${MAX_JITTER_SECONDS:-2400}
             JITTER_SEC=$(( $(od -An -N4 -tu4 /dev/urandom | tr -d ' ') % (MAX + 1) ))
             echo "Sleeping $JITTER_SEC seconds (jitter up to $MAX)."
             sleep "$JITTER_SEC"
