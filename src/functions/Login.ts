@@ -878,27 +878,95 @@ export class Login {
     }
 
     private async dismissLoginMessages(page: Page) {
-        if (await page.waitForSelector('[data-testid="biometricVideo"]', { timeout: 2000 }).catch(() => null)) {
+        // Passkey / Windows Hello prompt ("Sign in faster"), click "Skip for now"
+        // Primary heuristics: presence of biometric video OR title mentions passkey/sign in faster
+        const passkeyVideo = await page.waitForSelector('[data-testid="biometricVideo"]', { timeout: 2000 }).catch(() => null)
+        let handledPasskey = false
+        if (passkeyVideo) {
             const skipButton = await page.$('[data-testid="secondaryButton"]')
-            if (skipButton) { await skipButton.click().catch(() => { }); this.bot.log(this.bot.isMobile, 'DISMISS-ALL-LOGIN-MESSAGES', 'Dismissed "Use Passekey" modal'); await page.waitForTimeout(500) }
-        }
-        if (await page.waitForSelector('[data-testid="kmsiVideo"]', { timeout: 2000 }).catch(() => null)) {
-            const yesButton = await page.$('[data-testid="primaryButton"]')
-            if (yesButton) { await yesButton.click().catch(() => { }); this.bot.log(this.bot.isMobile, 'DISMISS-ALL-LOGIN-MESSAGES', 'Dismissed "Keep me signed in" modal'); await page.waitForTimeout(500) }
+            if (skipButton) {
+                await skipButton.click()
+                this.bot.log(this.bot.isMobile, 'DISMISS-ALL-LOGIN-MESSAGES', 'Dismissed "Use Passkey" modal via data-testid=secondaryButton')
+                await page.waitForTimeout(500)
+                handledPasskey = true
+            }
         }
 
-        // Also attempt to dismiss welcome/onboarding modals (the X in the top-right)
-        await this.dismissWelcomeModal(page)
+        if (!handledPasskey) {
+            // Fallback heuristics: title text or presence of primary+secondary buttons typical of the passkey screen
+            const titleEl = await page.waitForSelector('[data-testid="title"]', { timeout: 1000 }).catch(() => null)
+            const titleText = (titleEl ? (await titleEl.textContent()) : '')?.trim() || ''
+            const looksLikePasskeyTitle = /sign in faster|passkey/i.test(titleText)
+
+            const secondaryBtn = await page.waitForSelector('button[data-testid="secondaryButton"]', { timeout: 1000 }).catch(() => null)
+            const primaryBtn = await page.waitForSelector('button[data-testid="primaryButton"]', { timeout: 1000 }).catch(() => null)
+
+            if (looksLikePasskeyTitle && secondaryBtn) {
+                await secondaryBtn.click()
+                this.bot.log(this.bot.isMobile, 'DISMISS-ALL-LOGIN-MESSAGES', 'Dismissed Passkey screen by title + secondaryButton')
+                await page.waitForTimeout(500)
+                handledPasskey = true
+            } else if (secondaryBtn && primaryBtn) {
+                // If both buttons are visible (Next + Skip for now), prefer the secondary (Skip for now)
+                await secondaryBtn.click()
+                this.bot.log(this.bot.isMobile, 'DISMISS-ALL-LOGIN-MESSAGES', 'Dismissed Passkey screen by button pair heuristic')
+                await page.waitForTimeout(500)
+                handledPasskey = true
+            } else if (!handledPasskey) {
+                // Last-resort fallbacks by text and close icon
+                const skipByText = await page.locator('xpath=//button[contains(normalize-space(.), "Skip for now")]').first()
+                if (await skipByText.isVisible().catch(() => false)) {
+                    await skipByText.click()
+                    this.bot.log(this.bot.isMobile, 'DISMISS-ALL-LOGIN-MESSAGES', 'Dismissed Passkey screen via text fallback')
+                    await page.waitForTimeout(500)
+                    handledPasskey = true
+                } else {
+                    const closeBtn = await page.$('#close-button')
+                    if (closeBtn) {
+                        await closeBtn.click().catch(() => { })
+                        this.bot.log(this.bot.isMobile, 'DISMISS-ALL-LOGIN-MESSAGES', 'Attempted to close Passkey screen via close button')
+                        await page.waitForTimeout(500)
+                    }
+                }
+            }
+        }
+
+        // Use Keep me signed in
+        if (await page.waitForSelector('[data-testid="kmsiVideo"]', { timeout: 2000 }).catch(() => null)) {
+            const yesButton = await page.$('[data-testid="primaryButton"]')
+            if (yesButton) {
+                await yesButton.click()
+                this.bot.log(this.bot.isMobile, 'DISMISS-ALL-LOGIN-MESSAGES', 'Dismissed "Keep me signed in" modal')
+                await page.waitForTimeout(500)
+            }
+        }
+
     }
+
 
     /**
      * Try to detect and close common "welcome/tour/onboarding" modals that appear after login.
-     * The modal in your screenshot is a typical example — we look for various common close/x buttons
-     * and any dialog wrappers and click their close controls (best-effort).
+     * This version is more aggressive and general-purpose:
+     * - Attempts normal Playwright click on known close selectors
+     * - Attempts DOM click inside page.evaluate (bypasses pointer-event interception)
+     * - Hides/removes dialog/overlay nodes if clicks fail
+     * - Sends Escape and body clicks as fallback
+     *
+     * NOTE: This is intentionally noisy (logs lots of attempts) so you can tune and remove selectors later.
      */
     private async dismissWelcomeModal(page: Page) {
         try {
-            // A set of selectors that commonly map to the 'X' close button in various Microsoft modal implementations
+            // Quick domain check: send a single Escape and skip heavy work on other hosts
+            try {
+                const url = new URL(page.url());
+                if (!url.hostname.includes('bing.com') && !url.hostname.includes('rewards.bing.com')) {
+                    await page.keyboard.press('Escape').catch(() => {});
+                    return;
+                }
+            } catch { /* ignore URL parse errors */ }
+
+            this.bot.log(this.bot.isMobile, 'DISMISS-WELCOME', 'Attempting robust popup dismissal (max 2 attempts).');
+
             const closeSelectors = [
                 'button[aria-label="Close"]',
                 'button[aria-label="Close dialog"]',
@@ -915,50 +983,245 @@ export class Login {
                 '.ui-dialog .ui-dialog-titlebar-close',
                 'button[aria-label*="close"]',
                 'button[aria-label*="dismiss"]',
-                'button[data-purpose="close-modal"]'
-            ]
+                'button[data-purpose="close-modal"]',
+                '#popUpModal .close',
+                '#popUpModal button',
+                '.dashboardPopUpModal .close',
+                '.dashboardPopUpModal button',
+                '.popup .close',
+                '.popup-close',
+                '.pop-up .close',
+                'mee-rewards-user-status-banner .close',
+                'mee-rewards-user-status-banner button',
+                'div[role="dialog"] button',
+                'div[role="alertdialog"] button',
+                '.overlay .close',
+                '.modal-backdrop',
+                '.overlay'
+            ];
 
-            // Try to aggressively click all matching close buttons until none are visible
-            let clickedAny = false
-            for (const sel of closeSelectors) {
-                try {
-                    const el = await page.waitForSelector(sel, { timeout: 800 }).catch(() => null)
-                    if (el && await el.isVisible().catch(() => false)) {
-                        await el.click().catch(() => { })
-                        this.bot.log(this.bot.isMobile, 'DISMISS-WELCOME', `Clicked welcome modal close using selector: ${sel}`)
-                        clickedAny = true
-                        // small pause to allow DOM to update
-                        await this.bot.utils.wait(500)
-                    }
-                } catch (e) {
-                    // ignore selector-specific errors
-                }
-            }
+            const dialogContainers = [
+                'div[role="dialog"]',
+                'div[role="alertdialog"]',
+                '.modal',
+                '.ms-Dialog',
+                '.onboarding',
+                '.rewards-onboarding',
+                '.dashboardPopUpModal',
+                '#popUpModal',
+                '.popup',
+                '.streakPause',
+                '.streak-pause',
+                '[data-testid="popup"]',
+                'mee-rewards-user-status-banner'
+            ];
 
-            // Additional pass: find any dialog-like container and try finding an X inside it
-            try {
-                const dialogs = await page.$$('div[role="dialog"], .modal, .ms-Dialog, .onboarding, .rewards-onboarding')
-                for (const d of dialogs) {
+            let overallSucceeded = false;
+
+            // Run up to 2 attempts. If both fail, continue without blocking.
+            for (let attempt = 0; attempt < 2; attempt++) {
+                this.bot.log(this.bot.isMobile, 'DISMISS-WELCOME', `Dismiss attempt ${attempt + 1}/2`);
+
+                // Quick probe: any visible popup matches?
+                const hasPopup = await page.evaluate((params: { closeSel: string[]; dialogSel: string[] }) => {
+                    const closeSel = params.closeSel || [];
+                    const dialogSel = params.dialogSel || [];
                     try {
-                        const close = await d.$('button[aria-label="Close"], .close, button.close, .dismiss, button[aria-label*="close"]')
-                        if (close && await close.isVisible().catch(() => false)) {
-                            await close.click().catch(() => { })
-                            this.bot.log(this.bot.isMobile, 'DISMISS-WELCOME', 'Clicked dialog internal close button')
-                            clickedAny = true
-                            await this.bot.utils.wait(400)
+                        const selList = closeSel.concat(dialogSel);
+                        for (const s of selList) {
+                            try {
+                                const nodes = Array.from(document.querySelectorAll(s));
+                                for (const n of nodes) {
+                                    try {
+                                        const rect = (typeof (n as any).getBoundingClientRect === 'function') ? (n as any).getBoundingClientRect() : { width: 0, height: 0 };
+                                        const cs = window.getComputedStyle ? window.getComputedStyle(n as Element) : null;
+                                        const visibleRect = rect && rect.width > 0 && rect.height > 0;
+                                        const visibleStyle = cs ? (cs.display !== 'none' && cs.visibility !== 'hidden' && cs.opacity !== '0') : true;
+                                        if (visibleRect && visibleStyle) return true;
+                                    } catch { /* node-level */ }
+                                }
+                            } catch { /* selector-level */ }
                         }
-                    } catch { /* ignore per-dialog errors */ }
-                }
-            } catch { /* ignore */ }
+                    } catch { /* swallow */ }
+                    return false;
+                }, { closeSel: closeSelectors, dialogSel: dialogContainers }).catch(() => false);
 
-            // If we clicked something, give the page a small moment for animations to complete
-            if (clickedAny) {
-                await this.bot.utils.wait(600)
+                if (!hasPopup) {
+                    this.bot.log(this.bot.isMobile, 'DISMISS-WELCOME', 'No welcome/popups detected (probe).');
+                    overallSucceeded = true;
+                    break;
+                }
+
+                // Popup exists: do up to 3 passes per attempt
+                let attemptSucceeded = false;
+                for (let pass = 0; pass < 3; pass++) {
+                    // 1) Playwright forced clicks on known close selectors
+                    for (const sel of closeSelectors) {
+                        try {
+                            const locator = page.locator(sel).first();
+                            const cnt = await locator.count().catch(() => 0);
+                            if (cnt > 0) {
+                                const visible = await locator.isVisible().catch(() => false);
+                                if (visible) {
+                                    try {
+                                        await locator.click({ force: true }).catch(() => {});
+                                        this.bot.log(this.bot.isMobile, 'DISMISS-WELCOME', `Clicked close element via Playwright: ${sel}`);
+                                        await this.bot.utils.wait(200);
+                                    } catch (err) {
+                                        this.bot.log(this.bot.isMobile, 'DISMISS-WELCOME', `Playwright click error for ${sel}: ${err}`, 'warn');
+                                    }
+                                }
+                            }
+                        } catch { /* ignore per-selector errors */ }
+                    }
+
+                    // 2) DOM-evaluate click fallback (dispatch mouse events)
+                    try {
+                        const clicked = await page.evaluate((params: { selList: string[] }) => {
+                            try {
+                                for (const s of params.selList) {
+                                    try {
+                                        const nodes = Array.from(document.querySelectorAll(s));
+                                        for (const n of nodes) {
+                                            try {
+                                                const rect = (typeof (n as any).getBoundingClientRect === 'function') ? (n as any).getBoundingClientRect() : { width: 0, height: 0 };
+                                                const cs = window.getComputedStyle ? window.getComputedStyle(n as Element) : null;
+                                                const visibleRect = rect && rect.width > 0 && rect.height > 0;
+                                                const visibleStyle = cs ? (cs.display !== 'none' && cs.visibility !== 'hidden' && cs.opacity !== '0') : true;
+                                                if (!visibleRect || !visibleStyle) continue;
+                                                n.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
+                                                n.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true }));
+                                                n.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+                                                return true;
+                                            } catch { /* node-level */ }
+                                        }
+                                    } catch { /* selector-level */ }
+                                }
+                            } catch {}
+                            return false;
+                        }, { selList: closeSelectors }).catch(() => false);
+
+                        if (clicked) {
+                            this.bot.log(this.bot.isMobile, 'DISMISS-WELCOME', 'Clicked close via DOM-evaluate fallback');
+                            await this.bot.utils.wait(150);
+                        }
+                    } catch (err) {
+                        this.bot.log(this.bot.isMobile, 'DISMISS-WELCOME', `DOM-evaluate click failed: ${err}`, 'warn');
+                    }
+
+                    // 3) Safer hide of dialog containers (do not remove nodes)
+                    try {
+                        const hidden = await page.evaluate((params: { containers: string[] }) => {
+                            const containers = params.containers || [];
+                            let changed = false;
+                            try {
+                                for (const sel of containers) {
+                                    try {
+                                        const nodes = Array.from(document.querySelectorAll(sel));
+                                        for (const n of nodes) {
+                                            try {
+                                                const role = (n as Element).getAttribute ? (n as Element).getAttribute('role') : null;
+                                                const cls = (n as any).className || '';
+                                                const isEphemeral = (role === 'dialog' || role === 'alertdialog' || /popup|popUp|modal|overlay|dashboardPopUp/i.test(cls));
+                                                if (!isEphemeral) continue;
+                                                try { if ((n as any).style) (n as any).style.setProperty('pointer-events', 'none', 'important'); } catch {}
+                                                try { if ((n as any).style) (n as any).style.setProperty('display', 'none', 'important'); } catch {}
+                                                try { if ((n as any).style) (n as any).style.setProperty('opacity', '0', 'important'); } catch {}
+                                                try { if ((n as any).setAttribute) (n as any).setAttribute('aria-hidden', 'true'); } catch {}
+                                                try { if ((n as any).setAttribute) (n as any).setAttribute('data-removed-by-bot', '1'); } catch {}
+                                                changed = true;
+                                            } catch {}
+                                        }
+                                    } catch {}
+                                }
+
+                                // hide common backdrops
+                                try {
+                                    const backdrops = Array.from(document.querySelectorAll('.modal-backdrop, .backdrop, .overlay, [data-modal-overlay]'));
+                                    for (const b of backdrops) {
+                                        try { if ((b as any).style) (b as any).style.setProperty('display', 'none', 'important'); } catch {}
+                                        try { if ((b as any).setAttribute) (b as any).setAttribute('data-removed-by-bot', '1'); } catch {}
+                                        changed = true;
+                                    }
+                                } catch {}
+
+                                try { if (document.body && (document.body as any).style) (document.body as any).style.setProperty('pointer-events', 'auto', 'important'); } catch {}
+                            } catch {}
+                            return changed;
+                        }, { containers: dialogContainers }).catch(() => false);
+
+                        if (hidden) {
+                            this.bot.log(this.bot.isMobile, 'DISMISS-WELCOME', 'Safely hid ephemeral dialog containers (did not remove nodes)');
+                            await this.bot.utils.wait(150);
+                        }
+                    } catch (err) {
+                        this.bot.log(this.bot.isMobile, 'DISMISS-WELCOME', `DOM-evaluate hide attempt failed: ${err}`, 'warn');
+                    }
+
+                    // 4) Escape + small-body-click fallback
+                    try {
+                        await page.keyboard.press('Escape').catch(() => {});
+                        await page.mouse.click(5, 5).catch(() => {});
+                        await page.mouse.click(20, 20).catch(() => {});
+                        this.bot.log(this.bot.isMobile, 'DISMISS-WELCOME', 'Sent Escape and body-click fallbacks');
+                    } catch { /* ignore */ }
+
+                    // Short pause between passes
+                    await this.bot.utils.wait(300);
+
+                    // Probe whether popups still exist; if none, mark success for this attempt
+                    const stillHas = await page.evaluate((params: { closeSel: string[]; dialogSel: string[] }) => {
+                        const closeSel = params.closeSel || [];
+                        const dialogSel = params.dialogSel || [];
+                        try {
+                            const selList = closeSel.concat(dialogSel);
+                            for (const s of selList) {
+                                try {
+                                    const nodes = Array.from(document.querySelectorAll(s));
+                                    for (const n of nodes) {
+                                        try {
+                                            const rect = (typeof (n as any).getBoundingClientRect === 'function') ? (n as any).getBoundingClientRect() : { width: 0, height: 0 };
+                                            const cs = window.getComputedStyle ? window.getComputedStyle(n as Element) : null;
+                                            const visibleRect = rect && rect.width > 0 && rect.height > 0;
+                                            const visibleStyle = cs ? (cs.display !== 'none' && cs.visibility !== 'hidden' && cs.opacity !== '0') : true;
+                                            if (visibleRect && visibleStyle) return true;
+                                        } catch {}
+                                    }
+                                } catch {}
+                            }
+                        } catch {}
+                        return false;
+                    }, { closeSel: closeSelectors, dialogSel: dialogContainers }).catch(() => false);
+
+                    if (!stillHas) {
+                        attemptSucceeded = true;
+                        break;
+                    }
+                } // end passes
+
+                if (attemptSucceeded) {
+                    overallSucceeded = true;
+                    this.bot.log(this.bot.isMobile, 'DISMISS-WELCOME', `Dismiss attempt ${attempt + 1} succeeded.`);
+                    break;
+                } else {
+                    this.bot.log(this.bot.isMobile, 'DISMISS-WELCOME', `Dismiss attempt ${attempt + 1} did not clear popup; ${attempt === 0 ? 'one more run will be tried.' : 'no more attempts.'}`, 'warn');
+                    await this.bot.utils.wait(250);
+                }
+            } // end attempts
+
+            if (!overallSucceeded) {
+                this.bot.log(this.bot.isMobile, 'DISMISS-WELCOME', 'Popup dismissal failed after 2 attempts — continuing without blocking.', 'warn');
+            } else {
+                await this.bot.utils.wait(200);
             }
         } catch (err) {
-            this.bot.log(this.bot.isMobile, 'DISMISS-WELCOME', `Error while dismissing welcome modal: ${err}`, 'warn')
+            this.bot.log(this.bot.isMobile, 'DISMISS-WELCOME', `Error while dismissing welcome modal: ${err}`, 'warn');
         }
     }
+
+
+
+
 
     private async checkBingLogin(page: Page): Promise<void> {
         try {
