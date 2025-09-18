@@ -38,9 +38,42 @@ function sleep(ms: number) {
 }
 // --- end helpers ---
 
+// Relay-aware logging: calls the original logger and also forwards worker logs to master via IPC
+const originalLog = log
+function rlog(isMobileFlag: any, tag: string, message: string, level?: 'log' | 'warn' | 'error', color?: string | undefined) {
+    try {
+        // call original logger (keeps existing formatting behavior)
+        // cast color to any to satisfy original logger's expected color type (could be Chalk keys or similar)
+        originalLog(isMobileFlag, tag, message, level, color as any)
+    } catch (e) {
+        // fallback to console if logger crashes
+        try { console.log(`${tag}: ${message}`) } catch {}
+    }
+
+    // If this is a worker, forward the log to the master so all logs appear in the main terminal
+    if (!cluster.isPrimary && typeof process.send === 'function') {
+        try {
+            process.send({
+                __workerLog: true,
+                payload: {
+                    pid: process.pid,
+                    timestamp: new Date().toISOString(),
+                    isMobileFlag,
+                    tag,
+                    message,
+                    level,
+                    color
+                }
+            })
+        } catch (e) {
+            // ignore send errors
+        }
+    }
+}
+
 // Main bot class
 export class MicrosoftRewardsBot {
-    public log: typeof log
+    public log: typeof rlog
     public config
     public utils: Util
     public activities: Activities = new Activities(this)
@@ -67,7 +100,7 @@ export class MicrosoftRewardsBot {
 
     constructor(isMobile: boolean) {
         this.isMobile = isMobile
-        this.log = log
+        this.log = rlog
 
         this.accounts = []
         this.utils = new Util()
@@ -77,8 +110,21 @@ export class MicrosoftRewardsBot {
             utils: new BrowserUtil(this)
         }
         this.config = loadConfig()
-        this.activeWorkers = typeof (this.config as any)?.clusters === 'number' ? (this.config as any).clusters : 0
+        this.activeWorkers = this.config.clusters
         this.mobileRetryAttempts = 0
+
+        // If we're the master process, set up a listener so any forwarded worker logs are printed nicely
+        if (cluster.isPrimary) {
+            // cluster.workers will populate as workers are forked. We also attach listeners in runMasterWithStagger per worker.
+        }
+
+        // In the worker process, optionally patch process.stdout/stderr so libraries that write directly to them are visible.
+        if (!cluster.isPrimary) {
+            // ensure unhandled rejections surface
+            process.on('unhandledRejection', (reason) => {
+                try { rlog(this.isMobile, 'UNHANDLED', `Unhandled Rejection: ${String(reason)}`, 'error') } catch {}
+            })
+        }
     }
 
     async initialize() {
@@ -88,103 +134,152 @@ export class MicrosoftRewardsBot {
     }
 
     async run() {
-        log('main', 'MAIN', `Bot started with clusters=${(this.config as any)?.clusters ?? 'unset'}`)
+        rlog('main', 'MAIN', `Bot started with ${this.config.clusters} clusters`)
 
         // Optionally shuffle accounts globally (configurable)
         const shouldShuffle = (this.config as any)?.shuffleAccounts ?? false
         if (shouldShuffle) {
             shuffleArray(this.accounts)
-            log('main', 'MAIN', `Accounts shuffled (shuffleAccounts=true)`)
+            rlog('main', 'MAIN', `Accounts shuffled (shuffleAccounts=true)`)
         }
 
-        // Only cluster when there's more than 1 cluster demanded (numeric)
-        const clustersConfigured = (this.config as any)?.clusters ?? 0
-        if (clustersConfigured > 1) {
-            if (cluster.isPrimary) {
-                this.runMaster()
-            } else {
-                this.runWorker()
-            }
-        } else {
+        // If clusters <= 1 just run single-process logic
+        if (this.config.clusters <= 1) {
             await this.runTasks(this.accounts)
+            return
+        }
+
+        // Limit clusters to number of accounts so we don't spawn empty workers
+        const requestedClusters = this.config.clusters
+        const effectiveClusters = Math.max(1, Math.min(requestedClusters, this.accounts.length))
+        if (effectiveClusters !== requestedClusters) {
+            rlog('main', 'MAIN', `Adjusted clusters from ${requestedClusters} to ${effectiveClusters} to match account count`, 'warn')
+            this.config.clusters = effectiveClusters
+        }
+
+        if (cluster.isPrimary) {
+            this.runMasterWithStagger()
+        } else {
+            this.runWorker()
         }
     }
 
     /**
-     * Master logic:
-     * - forks all workers immediately (one per chunk)
-     * - computes a random delay for each worker within [clusterStaggerMinMs, clusterStaggerMaxMs]
-     * - sends { chunk, index, delayMs } to the worker
-     *
-     * Default stagger window is 45 minutes -> 1.2 hours (72 minutes).
-     * Overridable via config: clusterStaggerMinMs, clusterStaggerMaxMs
+     * Master: fork workers and provide each worker its own chunk of accounts plus an optional startDelay.
+     * The first worker starts immediately, remaining workers will stagger their start between 30-60 minutes.
+     * Also attaches message listeners to workers so forwarded logs are printed to the master terminal.
      */
-    private runMaster() {
-        log('main', 'MAIN-PRIMARY', 'Primary process started')
+    private runMasterWithStagger() {
+        rlog(false, 'MAIN-PRIMARY', 'Primary process started')
 
-        const clustersNum = (this.config as any)?.clusters
-        const numClusters = (typeof clustersNum === 'number' && clustersNum > 1) ? clustersNum : 1
-
-        // chunk accounts evenly into number of clusters
-        const accountChunks = this.utils.chunkArray(this.accounts, numClusters)
+        // Evenly chunk accounts into number of clusters
+        const accountChunks = this.utils.chunkArray(this.accounts, this.config.clusters)
 
         // set activeWorkers to the number of chunks we will create
         this.activeWorkers = accountChunks.length
 
-        // Stagger defaults: 45 minutes -> 1.2 hours (72 minutes)
-        const defaultMinMs = 45 * 60 * 1000           // 45 minutes
-        const defaultMaxMs = Math.round(1.2 * 60 * 60 * 1000) // 1.2 hours = 72 minutes -> 4,320,000 ms
-        const staggerMinMs = (this.config as any)?.clusterStaggerMinMs ?? defaultMinMs
-        const staggerMaxMs = (this.config as any)?.clusterStaggerMaxMs ?? defaultMaxMs
-
-        log('main', 'MAIN-PRIMARY', `Forking ${accountChunks.length} worker(s). Each worker will wait a random delay between ${Math.round(staggerMinMs / 60000)}m and ${Math.round(staggerMaxMs / 60000)}m before starting its tasks.`)
+        // constants for staggered start (30 - 60 minutes)
+        const STAGGER_MIN_MS = 30 * 60 * 1000 // 30 minutes
+        const STAGGER_MAX_MS = 60 * 60 * 1000 // 60 minutes
 
         for (let i = 0; i < accountChunks.length; i++) {
             const worker = cluster.fork()
-            const chunk = accountChunks[i]
+            const chunk = accountChunks[i]!
 
-            // Calculate per-worker random delay: all workers will receive a delay and will wait that long before starting.
-            // This ensures that workers do NOT all start work at the same time relative to the main process.
-            const delayMs = i === 0
-                ? 0 // first worker starts immediately; change this to randomInt(staggerMinMs, staggerMaxMs) if you want first worker delayed too
-                : randomInt(staggerMinMs, staggerMaxMs)
+            // Attach message listener immediately so we don't miss any forwarded logs
+            worker.on('message', (msg: any) => {
+                if (msg && msg.__workerLog && msg.payload) {
+                    const p = msg.payload
+                    // Print a concise, timestamped, prefixed log line to master terminal
+                    // Format: [worker PID] 2025-09-18T... [TAG] message
+                    const line = `[worker ${worker.process.pid}] ${p.timestamp} [${p.tag}] ${p.message}`
+                    // Use console directly so master terminal shows everything even if original logger is silenced
+                    console.log(line)
+                }
+            })
 
-            // send chunk + delay to worker
-            worker.send({ chunk, index: i, delayMs })
-            log('main', 'MAIN-PRIMARY', `Worker ${worker.process.pid} forked for chunk ${i} (accounts: ${chunk?.length ?? 0}) with delay ${Math.round(delayMs / 60000)} minute(s).`)
+            // First worker starts immediately; others get a randomized delay
+            const startDelay = (i === 0) ? 0 : randomInt(STAGGER_MIN_MS, STAGGER_MAX_MS)
+
+            // Attach metadata so worker can log/know its place
+            const message = {
+                chunk,
+                startDelay,
+                workerIndex: i + 1,
+                totalWorkers: accountChunks.length
+            }
+
+            // send the chunk and startDelay
+            worker.send(message)
+
+            rlog(false, 'MAIN-PRIMARY', `Forked worker ${worker.process.pid} assigned ${chunk.length} account(s) | startDelay=${startDelay}ms | worker ${i + 1}/${accountChunks.length}`)
         }
 
+        // Listen for worker exits and track active count
         cluster.on('exit', (worker, code, signal) => {
             this.activeWorkers -= 1
-            log('main', 'MAIN-WORKER', `Worker ${worker.process.pid} destroyed | Code: ${code} | Signal: ${signal} | Active workers: ${this.activeWorkers}`, 'warn')
+
+            rlog(false, 'MAIN-WORKER', `Worker ${worker.process.pid} exited | Code: ${code} | Signal: ${signal} | Active workers remaining: ${this.activeWorkers}`, 'warn')
 
             // Check if all workers have exited
             if (this.activeWorkers === 0) {
-                log('main', 'MAIN-WORKER', 'All workers destroyed. Exiting main process!', 'warn')
+                rlog(false, 'MAIN-WORKER', 'All workers destroyed. Exiting main process!', 'warn')
                 process.exit(0)
             }
+        })
+
+        // Graceful shutdown handling: relay to workers
+        process.on('SIGINT', () => {
+            rlog(false, 'MAIN-PRIMARY', 'SIGINT received. Asking workers to shut down gracefully...', 'warn')
+            for (const id in cluster.workers) {
+                cluster.workers[id]?.kill('SIGINT')
+            }
+            // if workers don't exit, master will exit on the 'exit' events above
+        })
+
+        // Catch unhandled errors in master to avoid silent death
+        process.on('unhandledRejection', (reason) => {
+            rlog(false, 'MAIN-PRIMARY', `Unhandled Rejection in master: ${reason}`, 'error')
         })
     }
 
     private runWorker() {
-        log('main', 'MAIN-WORKER', `Worker ${process.pid} spawned`)
-        // Receive the chunk of accounts and delay from the master
-        process.on('message', async (msg: any) => {
-            const { chunk, index, delayMs } = msg || {}
-            const accountsCount = Array.isArray(chunk) ? chunk.length : 0
-            const workerIndex = typeof index !== 'undefined' ? index : 'unknown'
+        rlog('main', 'MAIN-WORKER', `Worker ${process.pid} spawned`)
+        // Receive the chunk of accounts (and optional startDelay) from the master
+        process.on('message', async ({ chunk, startDelay, workerIndex, totalWorkers }: any) => {
+            try {
+                const idx = workerIndex ?? 0
+                const total = totalWorkers ?? 0
 
-            log('main', 'MAIN-WORKER', `Worker ${process.pid} received chunk ${workerIndex} with ${accountsCount} account(s).`)
+                if (startDelay && startDelay > 0) {
+                    rlog(this.isMobile, 'MAIN-WORKER', `Worker ${process.pid} (index ${idx}/${total}) will wait ${startDelay}ms before starting...`, 'log', 'yellow')
 
-            const delay = typeof delayMs === 'number' && delayMs > 0 ? delayMs : 0
-            if (delay > 0) {
-                log('main', 'MAIN-WORKER', `Worker ${process.pid} waiting ${Math.round(delay / 60000)} minute(s) before starting tasks...`)
-                await sleep(delay)
-            } else {
-                log('main', 'MAIN-WORKER', `Worker ${process.pid} starting tasks immediately.`)
+                    // Use utils.wait if available to be consistent with existing waits
+                    if (this.utils && typeof (this.utils as any).wait === 'function') {
+                        await (this.utils as any).wait(startDelay)
+                    } else {
+                        await sleep(startDelay)
+                    }
+                } else {
+                    rlog(this.isMobile, 'MAIN-WORKER', `Worker ${process.pid} (index ${idx}/${total}) starting immediately...`)
+                }
+
+                await this.runTasks(chunk)
+            } catch (err) {
+                rlog(this.isMobile, 'MAIN-WORKER', `Worker ${process.pid} encountered an error: ${err}`, 'error')
+                // ensure worker exits with non-zero so master can detect
+                process.exit(1)
             }
+        })
 
-            await this.runTasks(chunk || [])
+        // Extra graceful cleanup on worker
+        process.on('SIGINT', () => {
+            rlog(this.isMobile, 'MAIN-WORKER', `Worker ${process.pid} received SIGINT. Exiting...`, 'warn')
+            process.exit(0)
+        })
+
+        process.on('unhandledRejection', (reason) => {
+            rlog(this.isMobile, 'MAIN-WORKER', `Unhandled Rejection in worker: ${reason}`, 'error')
         })
     }
 
@@ -206,11 +301,11 @@ export class MicrosoftRewardsBot {
         const perAccountPageDelay = (this.config as any)?.perAccountPageDelayMs ?? 0
 
         for (const account of accounts) {
-            log('main', 'MAIN-WORKER', `Preparing tasks for account ${account.email}`)
+            rlog('main', 'MAIN-WORKER', `Preparing tasks for account ${account.email}`)
 
             // Random pre-start delay
             const preDelay = randomInt(startMin, startMax)
-            log('main', 'MAIN-WORKER', `Waiting ${preDelay}ms before starting account ${account.email}`)
+            rlog('main', 'MAIN-WORKER', `Waiting ${preDelay}ms before starting account ${account.email}`)
             if (this.utils && typeof (this.utils as any).wait === 'function') {
                 await (this.utils as any).wait(preDelay)
             } else {
@@ -242,14 +337,14 @@ export class MicrosoftRewardsBot {
                     await this.MobileWithSmallDelay(account, perAccountPageDelay)
                 }
 
-                log('main', 'MAIN-WORKER', `Completed tasks for account ${account.email}`, 'log', 'green')
+                rlog('main', 'MAIN-WORKER', `Completed tasks for account ${account.email}`, 'log', 'green')
             } catch (err) {
-                log('main', 'MAIN-WORKER', `Error in tasks for ${account.email}: ${err}`, 'error')
+                rlog('main', 'MAIN-WORKER', `Error in tasks for ${account.email}: ${err}`, 'error')
             }
 
             // Random post-finish delay
             const postDelay = randomInt(finishMin, finishMax)
-            log('main', 'MAIN-WORKER', `Waiting ${postDelay}ms after finishing account ${account.email}`)
+            rlog('main', 'MAIN-WORKER', `Waiting ${postDelay}ms after finishing account ${account.email}`)
             if (this.utils && typeof (this.utils as any).wait === 'function') {
                 await (this.utils as any).wait(postDelay)
             } else {
@@ -260,13 +355,13 @@ export class MicrosoftRewardsBot {
         // After first pass, check for accounts marked `doLater` and perform a single retry pass.
         const failedAccounts = (accounts || []).filter(a => (a as any).doLater)
         if (failedAccounts.length > 0) {
-            log('main', 'MAIN-RETRY', `Found ${failedAccounts.length} account(s) marked doLater. Performing a single retry pass...`, 'log', 'yellow')
+            rlog('main', 'MAIN-RETRY', `Found ${failedAccounts.length} account(s) marked doLater. Performing a single retry pass...`, 'log', 'yellow')
 
             for (const acc of failedAccounts) {
                 // Clear the flag before retry so handleFailedLogin can re-mark if it fails again
                 (acc as any).doLater = false
 
-                log('main', 'MAIN-RETRY', `Retrying account ${acc.email}`)
+                rlog('main', 'MAIN-RETRY', `Retrying account ${acc.email}`)
                 try {
                     if (this.config.parallel) {
                         await Promise.all([
@@ -287,20 +382,21 @@ export class MicrosoftRewardsBot {
                         await this.MobileWithSmallDelay(acc, perAccountPageDelay)
                     }
                 } catch (err) {
-                    log('main', 'MAIN-RETRY', `Retry failed for ${acc.email}: ${err}`, 'warn')
+                    rlog('main', 'MAIN-RETRY', `Retry failed for ${acc.email}: ${err}`, 'warn')
                 }
             }
 
             const stillFailed = (accounts || []).filter(a => (a as any).doLater)
             if (stillFailed.length > 0) {
-                log('main', 'MAIN-RETRY', `After retry, ${stillFailed.length} account(s) remain marked doLater. Please inspect them manually.`, 'error')
+                rlog('main', 'MAIN-RETRY', `After retry, ${stillFailed.length} account(s) remain marked doLater. Please inspect them manually.`, 'error')
             } else {
-                log('main', 'MAIN-RETRY', 'Retry pass succeeded for all previously failed accounts.', 'log', 'green')
+                rlog('main', 'MAIN-RETRY', 'Retry pass succeeded for all previously failed accounts.', 'log', 'green')
             }
         }
 
-        log(this.isMobile, 'MAIN-PRIMARY', 'Completed tasks for ALL accounts', 'log', 'green')
-        process.exit()
+        rlog(this.isMobile, 'MAIN-PRIMARY', 'Completed tasks for ALL accounts', 'log', 'green')
+        // Worker process exits when it finishes its assigned chunk
+        process.exit(0)
     }
 
     // wrapper to optionally add a small wait before/after Desktop run to reduce flakiness
@@ -329,14 +425,14 @@ export class MicrosoftRewardsBot {
         const browser = await this.browserFactory.createBrowser(account.proxy, account.email)
         this.homePage = await browser.newPage()
 
-        log(this.isMobile, 'MAIN', 'Starting browser')
+        rlog(this.isMobile, 'MAIN', 'Starting browser')
 
         // Login into MS Rewards, then go to rewards homepage
         await this.login.login(this.homePage, account.email, account.password)
 
         // If login failed, Login.handleFailedLogin will set `doLater = true` on the account.
         if ((account as any).doLater) {
-            log(this.isMobile, 'MAIN', `Login failed for ${account.email}. Skipping Desktop tasks and continuing.`, 'warn')
+            rlog(this.isMobile, 'MAIN', `Login failed for ${account.email}. Skipping Desktop tasks and continuing.`, 'warn')
             // ensure browser closed
             await this.browser.func.closeBrowser(browser, account.email)
             return
@@ -348,7 +444,7 @@ export class MicrosoftRewardsBot {
 
         this.pointsInitial = data.userStatus.availablePoints
 
-        log(this.isMobile, 'MAIN-POINTS', `Current point count: ${this.pointsInitial}`)
+        rlog(this.isMobile, 'MAIN-POINTS', `Current point count: ${this.pointsInitial}`)
 
         const browserEnarablePoints = await this.browser.func.getBrowserEarnablePoints()
 
@@ -357,11 +453,11 @@ export class MicrosoftRewardsBot {
             browserEnarablePoints.desktopSearchPoints
             + browserEnarablePoints.morePromotionsPoints
 
-        log(this.isMobile, 'MAIN-POINTS', `You can earn ${this.pointsCanCollect} points today`)
+        rlog(this.isMobile, 'MAIN-POINTS', `You can earn ${this.pointsCanCollect} points today`)
 
         // If runOnZeroPoints is false and 0 points to earn, don't continue
         if (!this.config.runOnZeroPoints && this.pointsCanCollect === 0) {
-            log(this.isMobile, 'MAIN', 'No points to earn and "runOnZeroPoints" is set to "false", stopping!', 'log', 'yellow')
+            rlog(this.isMobile, 'MAIN', 'No points to earn and "runOnZeroPoints" is set to "false", stopping!', 'log', 'yellow')
 
             // Close desktop browser
             await this.browser.func.closeBrowser(browser, account.email)
@@ -407,14 +503,14 @@ export class MicrosoftRewardsBot {
         const browser = await this.browserFactory.createBrowser(account.proxy, account.email)
         this.homePage = await browser.newPage()
 
-        log(this.isMobile, 'MAIN', 'Starting browser')
+        rlog(this.isMobile, 'MAIN', 'Starting browser')
 
         // Login into MS Rewards, then go to rewards homepage
         await this.login.login(this.homePage, account.email, account.password)
 
         // If login failed, skip mobile tasks
         if ((account as any).doLater) {
-            log(this.isMobile, 'MAIN', `Login failed for ${account.email}. Skipping Mobile tasks and continuing.`, 'warn')
+            rlog(this.isMobile, 'MAIN', `Login failed for ${account.email}. Skipping Mobile tasks and continuing.`, 'warn')
             await this.browser.func.closeBrowser(browser, account.email)
             return
         }
@@ -430,11 +526,11 @@ export class MicrosoftRewardsBot {
 
         this.pointsCanCollect = browserEnarablePoints.mobileSearchPoints + appEarnablePoints.totalEarnablePoints
 
-        log(this.isMobile, 'MAIN-POINTS', `You can earn ${this.pointsCanCollect} points today (Browser: ${browserEnarablePoints.mobileSearchPoints} points, App: ${appEarnablePoints.totalEarnablePoints} points)`)
+        rlog(this.isMobile, 'MAIN-POINTS', `You can earn ${this.pointsCanCollect} points today (Browser: ${browserEnarablePoints.mobileSearchPoints} points, App: ${appEarnablePoints.totalEarnablePoints} points)`)
 
         // If runOnZeroPoints is false and 0 points to earn, don't continue
         if (!this.config.runOnZeroPoints && this.pointsCanCollect === 0) {
-            log(this.isMobile, 'MAIN', 'No points to earn and "runOnZeroPoints" is set to "false", stopping!', 'log', 'yellow')
+            rlog(this.isMobile, 'MAIN', 'No points to earn and "runOnZeroPoints" is set to "false", stopping!', 'log', 'yellow')
 
             // Close mobile browser
             await this.browser.func.closeBrowser(browser, account.email)
@@ -473,9 +569,9 @@ export class MicrosoftRewardsBot {
 
                 // Exit if retries are exhausted
                 if (this.mobileRetryAttempts > this.config.searchSettings.retryMobileSearchAmount) {
-                    log(this.isMobile, 'MAIN', `Max retry limit of ${this.config.searchSettings.retryMobileSearchAmount} reached. Exiting retry loop`, 'warn')
+                    rlog(this.isMobile, 'MAIN', `Max retry limit of ${this.config.searchSettings.retryMobileSearchAmount} reached. Exiting retry loop`, 'warn')
                 } else if (this.mobileRetryAttempts !== 0) {
-                    log(this.isMobile, 'MAIN', `Attempt ${this.mobileRetryAttempts}/${this.config.searchSettings.retryMobileSearchAmount}: Unable to complete mobile searches, bad User-Agent? Increase search delay? Retrying...`, 'log', 'yellow')
+                    rlog(this.isMobile, 'MAIN', `Attempt ${this.mobileRetryAttempts}/${this.config.searchSettings.retryMobileSearchAmount}: Unable to complete mobile searches, bad User-Agent? Increase search delay? Retrying...`, 'log', 'yellow')
 
                     // Close mobile browser
                     await this.browser.func.closeBrowser(browser, account.email)
@@ -485,13 +581,13 @@ export class MicrosoftRewardsBot {
                     return
                 }
             } else {
-                log(this.isMobile, 'MAIN', 'Unable to fetch search points, your account is most likely too "new" for this! Try again later!', 'warn')
+                rlog(this.isMobile, 'MAIN', 'Unable to fetch search points, your account is most likely too "new" for this! Try again later!', 'warn')
             }
         }
 
         const afterPointAmount = await this.browser.func.getCurrentPoints()
 
-        log(this.isMobile, 'MAIN-POINTS', `The script collected ${afterPointAmount - this.pointsInitial} points today`)
+        rlog(this.isMobile, 'MAIN-POINTS', `The script collected ${afterPointAmount - this.pointsInitial} points today`)
 
         // Close mobile browser
         await this.browser.func.closeBrowser(browser, account.email)
@@ -506,12 +602,12 @@ async function main() {
         await rewardsBot.initialize()
         await rewardsBot.run()
     } catch (error) {
-        log(false, 'MAIN-ERROR', `Error running desktop bot: ${error}`, 'error')
+        rlog(false, 'MAIN-ERROR', `Error running desktop bot: ${error}`, 'error')
     }
 }
 
 // Start the bots
 main().catch(error => {
-    log('main', 'MAIN-ERROR', `Error running bots: ${error}`, 'error')
+    rlog('main', 'MAIN-ERROR', `Error running bots: ${error}`, 'error')
     process.exit(1)
 })
