@@ -77,7 +77,7 @@ export class MicrosoftRewardsBot {
             utils: new BrowserUtil(this)
         }
         this.config = loadConfig()
-        this.activeWorkers = this.config.clusters
+        this.activeWorkers = typeof (this.config as any)?.clusters === 'number' ? (this.config as any).clusters : 0
         this.mobileRetryAttempts = 0
     }
 
@@ -88,7 +88,7 @@ export class MicrosoftRewardsBot {
     }
 
     async run() {
-        log('main', 'MAIN', `Bot started with ${this.config.clusters} clusters`)
+        log('main', 'MAIN', `Bot started with clusters=${(this.config as any)?.clusters ?? 'unset'}`)
 
         // Optionally shuffle accounts globally (configurable)
         const shouldShuffle = (this.config as any)?.shuffleAccounts ?? false
@@ -97,8 +97,9 @@ export class MicrosoftRewardsBot {
             log('main', 'MAIN', `Accounts shuffled (shuffleAccounts=true)`)
         }
 
-        // Only cluster when there's more than 1 cluster demanded
-        if (this.config.clusters > 1) {
+        // Only cluster when there's more than 1 cluster demanded (numeric)
+        const clustersConfigured = (this.config as any)?.clusters ?? 0
+        if (clustersConfigured > 1) {
             if (cluster.isPrimary) {
                 this.runMaster()
             } else {
@@ -109,25 +110,53 @@ export class MicrosoftRewardsBot {
         }
     }
 
+    /**
+     * Master logic:
+     * - forks all workers immediately (one per chunk)
+     * - computes a random delay for each worker within [clusterStaggerMinMs, clusterStaggerMaxMs]
+     * - sends { chunk, index, delayMs } to the worker
+     *
+     * Default stagger window is 45 minutes -> 1.2 hours (72 minutes).
+     * Overridable via config: clusterStaggerMinMs, clusterStaggerMaxMs
+     */
     private runMaster() {
         log('main', 'MAIN-PRIMARY', 'Primary process started')
 
+        const clustersNum = (this.config as any)?.clusters
+        const numClusters = (typeof clustersNum === 'number' && clustersNum > 1) ? clustersNum : 1
+
         // chunk accounts evenly into number of clusters
-        const accountChunks = this.utils.chunkArray(this.accounts, this.config.clusters)
+        const accountChunks = this.utils.chunkArray(this.accounts, numClusters)
 
         // set activeWorkers to the number of chunks we will create
         this.activeWorkers = accountChunks.length
 
+        // Stagger defaults: 45 minutes -> 1.2 hours (72 minutes)
+        const defaultMinMs = 45 * 60 * 1000           // 45 minutes
+        const defaultMaxMs = Math.round(1.2 * 60 * 60 * 1000) // 1.2 hours = 72 minutes -> 4,320,000 ms
+        const staggerMinMs = (this.config as any)?.clusterStaggerMinMs ?? defaultMinMs
+        const staggerMaxMs = (this.config as any)?.clusterStaggerMaxMs ?? defaultMaxMs
+
+        log('main', 'MAIN-PRIMARY', `Forking ${accountChunks.length} worker(s). Each worker will wait a random delay between ${Math.round(staggerMinMs / 60000)}m and ${Math.round(staggerMaxMs / 60000)}m before starting its tasks.`)
+
         for (let i = 0; i < accountChunks.length; i++) {
             const worker = cluster.fork()
             const chunk = accountChunks[i]
-            worker.send({ chunk })
+
+            // Calculate per-worker random delay: all workers will receive a delay and will wait that long before starting.
+            // This ensures that workers do NOT all start work at the same time relative to the main process.
+            const delayMs = i === 0
+                ? 0 // first worker starts immediately; change this to randomInt(staggerMinMs, staggerMaxMs) if you want first worker delayed too
+                : randomInt(staggerMinMs, staggerMaxMs)
+
+            // send chunk + delay to worker
+            worker.send({ chunk, index: i, delayMs })
+            log('main', 'MAIN-PRIMARY', `Worker ${worker.process.pid} forked for chunk ${i} (accounts: ${chunk?.length ?? 0}) with delay ${Math.round(delayMs / 60000)} minute(s).`)
         }
 
-        cluster.on('exit', (worker, code) => {
+        cluster.on('exit', (worker, code, signal) => {
             this.activeWorkers -= 1
-
-            log('main', 'MAIN-WORKER', `Worker ${worker.process.pid} destroyed | Code: ${code} | Active workers: ${this.activeWorkers}`, 'warn')
+            log('main', 'MAIN-WORKER', `Worker ${worker.process.pid} destroyed | Code: ${code} | Signal: ${signal} | Active workers: ${this.activeWorkers}`, 'warn')
 
             // Check if all workers have exited
             if (this.activeWorkers === 0) {
@@ -139,9 +168,23 @@ export class MicrosoftRewardsBot {
 
     private runWorker() {
         log('main', 'MAIN-WORKER', `Worker ${process.pid} spawned`)
-        // Receive the chunk of accounts from the master
-        process.on('message', async ({ chunk }) => {
-            await this.runTasks(chunk)
+        // Receive the chunk of accounts and delay from the master
+        process.on('message', async (msg: any) => {
+            const { chunk, index, delayMs } = msg || {}
+            const accountsCount = Array.isArray(chunk) ? chunk.length : 0
+            const workerIndex = typeof index !== 'undefined' ? index : 'unknown'
+
+            log('main', 'MAIN-WORKER', `Worker ${process.pid} received chunk ${workerIndex} with ${accountsCount} account(s).`)
+
+            const delay = typeof delayMs === 'number' && delayMs > 0 ? delayMs : 0
+            if (delay > 0) {
+                log('main', 'MAIN-WORKER', `Worker ${process.pid} waiting ${Math.round(delay / 60000)} minute(s) before starting tasks...`)
+                await sleep(delay)
+            } else {
+                log('main', 'MAIN-WORKER', `Worker ${process.pid} starting tasks immediately.`)
+            }
+
+            await this.runTasks(chunk || [])
         })
     }
 
