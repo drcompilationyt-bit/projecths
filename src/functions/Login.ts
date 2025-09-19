@@ -39,6 +39,77 @@ export class Login {
         this.bot = bot
     }
 
+    // Handle common optional login prompts (Stay signed in?, Skip, Not now, etc.).
+    // If a prompt is detected and dismissed, perform a randomized longer wait (1-1.5 minutes)
+    // to ensure the UI/session fully stabilizes before proceeding.
+    private async randomLongWait(page: Page, minMs: number = 60000, maxMs: number = 90000) {
+        const ms = Math.floor(Math.random() * (maxMs - minMs + 1)) + minMs;
+        // small initial pause then the long wait
+        await page.waitForTimeout(500);
+
+        // Handle optional post-login prompts and wait if any were dismissed
+        await this.handleOptionalPrompts(page);
+        await page.waitForTimeout(ms);
+    }
+
+    private async handleOptionalPrompts(page: Page) {
+        // A conservative list of selectors for common Microsoft login prompts.
+        const tries = [
+            `button#idBtn_Back`, // often the "No" button
+            `button#idSIButton9`,
+            `button:has-text("No")`,
+            `button:has-text("Don't show again")`,
+            `button:has-text("Skip")`,
+            `button:has-text("Not now")`,
+            `button:has-text("Use another account")`,
+            `button:has-text("Continue")`,
+            `input[type="button"][value="No"]`,
+        ];
+
+        for (const sel of tries) {
+            try {
+                const handle = await page.$(sel);
+                if (handle) {
+                    try {
+                        await handle.click();
+                    } catch (e) {
+                        try {
+                            await page.evaluate((s) => {
+                                const el = document.querySelector(s) as HTMLElement | null;
+                                if (el) el.click();
+                            }, sel);
+                        } catch (ee) {
+                            // ignore
+                        }
+                    }
+                    // Give a short pause for UI changes
+                    await page.waitForTimeout(800);
+                    // After dismissing a prompt, wait a randomized long delay to ensure the rewards page has settled.
+                    await this.randomLongWait(page);
+                    // After handling one prompt, continue to check if more prompts appear.
+                }
+            } catch (e) {
+                // ignore and continue
+            }
+        }
+
+        // As a fallback, press Escape if a dialog overlay is detected
+        try {
+            const dialog = await page.$('[role="dialog"], .modal, .ms-Dialog, .overlay, .authModal');
+            if (dialog) {
+                const isVisible = await (dialog as any).isVisible?.();
+                if (isVisible !== false) {
+                    await page.keyboard.press('Escape');
+                    await page.waitForTimeout(600);
+                }
+            }
+        } catch (e) {
+            // ignore
+        }
+    }
+
+
+
     async login(page: Page, email: string, password: string) {
         try {
             this.bot.log(this.bot.isMobile, 'LOGIN', 'Starting login process!')
@@ -148,6 +219,12 @@ export class Login {
                             const newPage: Page = await (context as any).newPage()
                             await newPage.goto('https://rewards.bing.com', { waitUntil: 'domcontentloaded' })
                             await this.bot.utils.wait(1500)
+
+                            // WAIT: ensure previous page/context settles before closing the old page.
+                            // Some environments require ~40-60 seconds to allow background cleanup; add randomized delay.
+                            const waitMs = 40000 + Math.floor(Math.random() * 20000); // 40-60 seconds
+                            this.bot.log(this.bot.isMobile, 'LOGIN', `Waiting ${waitMs}ms after opening new page before closing old page to avoid race conditions`);
+                            await this.bot.utils.wait(waitMs);
 
                             // Close previous page if it still exists and is different
                             try {
@@ -1751,3 +1828,4 @@ export class Login {
         return null
     }
 }
+
