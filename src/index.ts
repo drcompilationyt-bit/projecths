@@ -425,6 +425,18 @@ export class MicrosoftRewardsBot {
         const browser = await this.browserFactory.createBrowser(account.proxy, account.email)
         this.homePage = await browser.newPage()
 
+
+        {
+            // WAIT: ensure new page/context settles before continuing.
+            // Some environments require ~40-60 seconds to allow background cleanup; add randomized delay.
+            const waitMs = 40000 + Math.floor(Math.random() * 20000); // 40-60 seconds
+            this.log(this.isMobile, 'MAIN', `Waiting ${waitMs}ms after creating new page to avoid race conditions`);
+            if (this.utils && typeof (this.utils as any).wait === 'function') {
+                await (this.utils as any).wait(waitMs)
+            } else {
+                await sleep(waitMs)
+            }
+        }
         rlog(this.isMobile, 'MAIN', 'Starting browser')
 
         // Login into MS Rewards, then go to rewards homepage
@@ -467,7 +479,19 @@ export class MicrosoftRewardsBot {
         // Open a new tab to where the tasks are going to be completed
         const workerPage = await browser.newPage()
 
-        // Go to homepage on worker page
+
+        {
+            // WAIT: ensure new page/context settles before continuing.
+            // Some environments require ~40-60 seconds to allow background cleanup; add randomized delay.
+            const waitMs = 40000 + Math.floor(Math.random() * 20000); // 40-60 seconds
+            this.log(this.isMobile, 'MAIN', `Waiting ${waitMs}ms after creating new page to avoid race conditions`);
+            if (this.utils && typeof (this.utils as any).wait === 'function') {
+                await (this.utils as any).wait(waitMs)
+            } else {
+                await sleep(waitMs)
+            }
+        }
+// Go to homepage on worker page
         await this.browser.func.goHome(workerPage)
 
         // Complete daily set
@@ -503,6 +527,18 @@ export class MicrosoftRewardsBot {
         const browser = await this.browserFactory.createBrowser(account.proxy, account.email)
         this.homePage = await browser.newPage()
 
+
+        {
+            // WAIT: ensure new page/context settles before continuing.
+            // Some environments require ~40-60 seconds to allow background cleanup; add randomized delay.
+            const waitMs = 40000 + Math.floor(Math.random() * 20000); // 40-60 seconds
+            this.log(this.isMobile, 'MAIN', `Waiting ${waitMs}ms after creating new page to avoid race conditions`);
+            if (this.utils && typeof (this.utils as any).wait === 'function') {
+                await (this.utils as any).wait(waitMs)
+            } else {
+                await sleep(waitMs)
+            }
+        }
         rlog(this.isMobile, 'MAIN', 'Starting browser')
 
         // Login into MS Rewards, then go to rewards homepage
@@ -554,7 +590,19 @@ export class MicrosoftRewardsBot {
                 // Open a new tab to where the tasks are going to be completed
                 const workerPage = await browser.newPage()
 
-                // Go to homepage on worker page
+
+                {
+                    // WAIT: ensure new page/context settles before continuing.
+                    // Some environments require ~40-60 seconds to allow background cleanup; add randomized delay.
+                    const waitMs = 40000 + Math.floor(Math.random() * 20000); // 40-60 seconds
+                    this.log(this.isMobile, 'MAIN', `Waiting ${waitMs}ms after creating new page to avoid race conditions`);
+                    if (this.utils && typeof (this.utils as any).wait === 'function') {
+                        await (this.utils as any).wait(waitMs)
+                    } else {
+                        await sleep(waitMs)
+                    }
+                }
+// Go to homepage on worker page
                 await this.browser.func.goHome(workerPage)
 
                 await this.activities.doSearch(workerPage, data)
