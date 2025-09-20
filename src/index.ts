@@ -43,7 +43,6 @@ const originalLog = log
 function rlog(isMobileFlag: any, tag: string, message: string, level?: 'log' | 'warn' | 'error', color?: string | undefined) {
     try {
         // call original logger (keeps existing formatting behavior)
-        // cast color to any to satisfy original logger's expected color type (could be Chalk keys or similar)
         originalLog(isMobileFlag, tag, message, level, color as any)
     } catch (e) {
         // fallback to console if logger crashes
@@ -74,7 +73,7 @@ function rlog(isMobileFlag: any, tag: string, message: string, level?: 'log' | '
 // Main bot class
 export class MicrosoftRewardsBot {
     public log: typeof rlog
-    public config
+    public config: any
     public utils: Util
     public activities: Activities = new Activities(this)
     public browser: {
@@ -190,10 +189,7 @@ export class MicrosoftRewardsBot {
             worker.on('message', (msg: any) => {
                 if (msg && msg.__workerLog && msg.payload) {
                     const p = msg.payload
-                    // Print a concise, timestamped, prefixed log line to master terminal
-                    // Format: [worker PID] 2025-09-18T... [TAG] message
                     const line = `[worker ${worker.process.pid}] ${p.timestamp} [${p.tag}] ${p.message}`
-                    // Use console directly so master terminal shows everything even if original logger is silenced
                     console.log(line)
                 }
             })
@@ -234,7 +230,6 @@ export class MicrosoftRewardsBot {
             for (const id in cluster.workers) {
                 cluster.workers[id]?.kill('SIGINT')
             }
-            // if workers don't exit, master will exit on the 'exit' events above
         })
 
         // Catch unhandled errors in master to avoid silent death
@@ -303,6 +298,9 @@ export class MicrosoftRewardsBot {
         for (const account of accounts) {
             rlog('main', 'MAIN-WORKER', `Preparing tasks for account ${account.email}`)
 
+            // Reset per-account mobile retry counter
+            this.mobileRetryAttempts = 0
+
             // Random pre-start delay
             const preDelay = randomInt(startMin, startMax)
             rlog('main', 'MAIN-WORKER', `Waiting ${preDelay}ms before starting account ${account.email}`)
@@ -316,29 +314,68 @@ export class MicrosoftRewardsBot {
 
             try {
                 if (this.config.parallel) {
-                    await Promise.all([
-                        this.DesktopWithSmallDelay(account, perAccountPageDelay),
-                        (async () => {
+                    // Run Desktop and Mobile in parallel but isolate failures so one side can't abort the other
+                    const desktopPromise = (async () => {
+                        try {
+                            await this.DesktopWithSmallDelay(account, perAccountPageDelay)
+                            return { ok: true }
+                        } catch (err) {
+                            rlog(this.isMobile, 'PARALLEL', `Desktop error for ${account.email}: ${err}`, 'error')
+                            return { ok: false, error: err }
+                        }
+                    })()
+
+                    const mobilePromise = (async () => {
+                        try {
                             const mobileInstance = new MicrosoftRewardsBot(true)
                             // reuse axios/proxy for mobile instance
                             mobileInstance.axios = this.axios
                             // ensure config/accounts available
                             mobileInstance.config = this.config
                             mobileInstance.utils = this.utils
-                            // initialize minimal things needed by Mobile
-                            return mobileInstance.Mobile(account)
-                        })()
-                    ])
-                } else {
-                    this.isMobile = false
-                    await this.DesktopWithSmallDelay(account, perAccountPageDelay)
+                            // initialize minimal things needed by Mobile (constructor did most)
+                            await mobileInstance.Mobile(account)
+                            return { ok: true }
+                        } catch (err) {
+                            rlog(this.isMobile, 'PARALLEL', `Mobile error for ${account.email}: ${err}`, 'error')
+                            return { ok: false, error: err }
+                        }
+                    })()
 
-                    this.isMobile = true
-                    await this.MobileWithSmallDelay(account, perAccountPageDelay)
+                    const settled = await Promise.allSettled([desktopPromise, mobilePromise])
+
+                    // Log summary for visibility (but don't throw)
+                    settled.forEach((res, idx) => {
+                        if (res.status === 'fulfilled') {
+                            const r = res.value as any
+                            if (!r.ok) {
+                                rlog(this.isMobile, 'PARALLEL', `Task ${idx === 0 ? 'Desktop' : 'Mobile'} returned error for ${account.email}: ${r.error}`, 'warn')
+                            }
+                        } else {
+                            rlog(this.isMobile, 'PARALLEL', `Task ${idx === 0 ? 'Desktop' : 'Mobile'} rejected unexpectedly for ${account.email}: ${res.reason}`, 'warn')
+                        }
+                    })
+
+                } else {
+                    // Sequential mode — run Desktop then Mobile, both wrapped individually
+                    try {
+                        this.isMobile = false
+                        await this.DesktopWithSmallDelay(account, perAccountPageDelay)
+                    } catch (err) {
+                        rlog(this.isMobile, 'SEQUENTIAL', `Desktop failed for ${account.email}: ${err}`, 'error')
+                    }
+
+                    try {
+                        this.isMobile = true
+                        await this.MobileWithSmallDelay(account, perAccountPageDelay)
+                    } catch (err) {
+                        rlog(this.isMobile, 'SEQUENTIAL', `Mobile failed for ${account.email}: ${err}`, 'error')
+                    }
                 }
 
                 rlog('main', 'MAIN-WORKER', `Completed tasks for account ${account.email}`, 'log', 'green')
             } catch (err) {
+                // This outer catch should rarely trigger now because inner tasks handle their own errors.
                 rlog('main', 'MAIN-WORKER', `Error in tasks for ${account.email}: ${err}`, 'error')
             }
 
@@ -364,22 +401,45 @@ export class MicrosoftRewardsBot {
                 rlog('main', 'MAIN-RETRY', `Retrying account ${acc.email}`)
                 try {
                     if (this.config.parallel) {
-                        await Promise.all([
-                            this.DesktopWithSmallDelay(acc, perAccountPageDelay),
-                            (async () => {
+                        const desktopPromise = (async () => {
+                            try {
+                                await this.DesktopWithSmallDelay(acc, perAccountPageDelay)
+                                return { ok: true }
+                            } catch (err) {
+                                rlog(this.isMobile, 'RETRY', `Desktop retry error for ${acc.email}: ${err}`, 'warn')
+                                return { ok: false, error: err }
+                            }
+                        })()
+
+                        const mobilePromise = (async () => {
+                            try {
                                 const mobileInstance = new MicrosoftRewardsBot(true)
                                 mobileInstance.axios = this.axios
                                 mobileInstance.config = this.config
                                 mobileInstance.utils = this.utils
-                                return mobileInstance.Mobile(acc)
-                            })()
-                        ])
-                    } else {
-                        this.isMobile = false
-                        await this.DesktopWithSmallDelay(acc, perAccountPageDelay)
+                                await mobileInstance.Mobile(acc)
+                                return { ok: true }
+                            } catch (err) {
+                                rlog(this.isMobile, 'RETRY', `Mobile retry error for ${acc.email}: ${err}`, 'warn')
+                                return { ok: false, error: err }
+                            }
+                        })()
 
-                        this.isMobile = true
-                        await this.MobileWithSmallDelay(acc, perAccountPageDelay)
+                        await Promise.allSettled([desktopPromise, mobilePromise])
+                    } else {
+                        try {
+                            this.isMobile = false
+                            await this.DesktopWithSmallDelay(acc, perAccountPageDelay)
+                        } catch (err) {
+                            rlog(this.isMobile, 'MAIN-RETRY', `Desktop retry failed for ${acc.email}: ${err}`, 'warn')
+                        }
+
+                        try {
+                            this.isMobile = true
+                            await this.MobileWithSmallDelay(acc, perAccountPageDelay)
+                        } catch (err) {
+                            rlog(this.isMobile, 'MAIN-RETRY', `Mobile retry failed for ${acc.email}: ${err}`, 'warn')
+                        }
                     }
                 } catch (err) {
                     rlog('main', 'MAIN-RETRY', `Retry failed for ${acc.email}: ${err}`, 'warn')
@@ -491,7 +551,7 @@ export class MicrosoftRewardsBot {
                 await sleep(waitMs)
             }
         }
-// Go to homepage on worker page
+        // Go to homepage on worker page
         await this.browser.func.goHome(workerPage)
 
         // Complete daily set
@@ -560,36 +620,62 @@ export class MicrosoftRewardsBot {
         const browserEnarablePoints = await this.browser.func.getBrowserEarnablePoints()
         const appEarnablePoints = await this.browser.func.getAppEarnablePoints(this.accessToken)
 
-        this.pointsCanCollect = browserEnarablePoints.mobileSearchPoints + appEarnablePoints.totalEarnablePoints
+        // browser mobile-search points (may be undefined; default to 0)
+        const browserMobilePoints = browserEnarablePoints.mobileSearchPoints ?? 0
 
-        rlog(this.isMobile, 'MAIN-POINTS', `You can earn ${this.pointsCanCollect} points today (Browser: ${browserEnarablePoints.mobileSearchPoints} points, App: ${appEarnablePoints.totalEarnablePoints} points)`)
+        let totalAppPoints = 0
+        let appFetchFailed = false
 
-        // If runOnZeroPoints is false and 0 points to earn, don't continue
-        if (!this.config.runOnZeroPoints && this.pointsCanCollect === 0) {
+        if (appEarnablePoints && appEarnablePoints.fetchError) {
+            // app API fetch failed — don't treat missing app points as real zeroes.
+            appFetchFailed = true
+            this.log(this.isMobile, 'MAIN', 'App earnable points fetch failed; proceeding using browser points only.')
+        } else {
+            totalAppPoints = appEarnablePoints?.totalEarnablePoints ?? 0
+        }
+
+        this.pointsCanCollect = browserMobilePoints + totalAppPoints
+
+        rlog(this.isMobile, 'MAIN-POINTS', `You can earn ${this.pointsCanCollect} points today (Browser: ${browserMobilePoints} points, App: ${appFetchFailed ? 'unknown (fetch failed)' : totalAppPoints + ' points'})`)
+
+        // Decide whether to stop for zero points:
+        // - If app fetch failed, don't stop just because app points are unknown; only stop if browserMobilePoints === 0 and runOnZeroPoints=false
+        if (!this.config.runOnZeroPoints && this.pointsCanCollect === 0 && !appFetchFailed) {
             rlog(this.isMobile, 'MAIN', 'No points to earn and "runOnZeroPoints" is set to "false", stopping!', 'log', 'yellow')
-
-            // Close mobile browser
             await this.browser.func.closeBrowser(browser, account.email)
             return
+        } else if (!this.config.runOnZeroPoints && this.pointsCanCollect === 0 && appFetchFailed) {
+            // app unknown but browser is zero — proceed (you can change this to be more conservative)
+            rlog(this.isMobile, 'MAIN', 'App points unknown due to fetch error but proceeding because app data is unavailable.', 'log', 'yellow')
         }
 
         // Do daily check in
         if (this.config.workers.doDailyCheckIn) {
-            await this.activities.doDailyCheckIn(this.accessToken, data)
+            try {
+                await this.activities.doDailyCheckIn(this.accessToken, data)
+            } catch (err) {
+                rlog(this.isMobile, 'MOBILE', `DailyCheckIn failed for ${account.email}: ${err}`, 'warn')
+            }
         }
 
         // Do read to earn
         if (this.config.workers.doReadToEarn) {
-            await this.activities.doReadToEarn(this.accessToken, data)
+            try {
+                await this.activities.doReadToEarn(this.accessToken, data)
+            } catch (err) {
+                rlog(this.isMobile, 'MOBILE', `ReadToEarn failed for ${account.email}: ${err}`, 'warn')
+            }
         }
 
         // Do mobile searches
         if (this.config.workers.doMobileSearch) {
             // If no mobile searches data found, stop (Does not always exist on new accounts)
             if (data.userStatus.counters.mobileSearch) {
+                // Reset per-account mobile retry attempts
+                this.mobileRetryAttempts = 0
+
                 // Open a new tab to where the tasks are going to be completed
                 const workerPage = await browser.newPage()
-
 
                 {
                     // WAIT: ensure new page/context settles before continuing.
@@ -602,31 +688,45 @@ export class MicrosoftRewardsBot {
                         await sleep(waitMs)
                     }
                 }
-// Go to homepage on worker page
+                // Go to homepage on worker page
                 await this.browser.func.goHome(workerPage)
 
-                await this.activities.doSearch(workerPage, data)
+                try {
+                    await this.activities.doSearch(workerPage, data)
+                } catch (err) {
+                    rlog(this.isMobile, 'MOBILE', `Mobile searches failed for ${account.email}: ${err}`, 'warn')
+                }
 
                 // Fetch current search points
-                const mobileSearchPoints = (await this.browser.func.getSearchPoints()).mobileSearch?.[0]
+                const mobileSearchCounter = (await this.browser.func.getSearchPoints()).mobileSearch?.[0]
 
-                if (mobileSearchPoints && (mobileSearchPoints.pointProgressMax - mobileSearchPoints.pointProgress) > 0) {
+                if (mobileSearchCounter && (mobileSearchCounter.pointProgressMax - mobileSearchCounter.pointProgress) > 0) {
                     // Increment retry count
                     this.mobileRetryAttempts++
                 }
 
                 // Exit if retries are exhausted
-                if (this.mobileRetryAttempts > this.config.searchSettings.retryMobileSearchAmount) {
-                    rlog(this.isMobile, 'MAIN', `Max retry limit of ${this.config.searchSettings.retryMobileSearchAmount} reached. Exiting retry loop`, 'warn')
+                if (this.mobileRetryAttempts > (this.config.searchSettings?.retryMobileSearchAmount ?? 2)) {
+                    rlog(this.isMobile, 'MAIN', `Max retry limit of ${this.config.searchSettings?.retryMobileSearchAmount ?? 2} reached. Not retrying further.`, 'warn')
                 } else if (this.mobileRetryAttempts !== 0) {
-                    rlog(this.isMobile, 'MAIN', `Attempt ${this.mobileRetryAttempts}/${this.config.searchSettings.retryMobileSearchAmount}: Unable to complete mobile searches, bad User-Agent? Increase search delay? Retrying...`, 'log', 'yellow')
+                    rlog(this.isMobile, 'MAIN', `Attempt ${this.mobileRetryAttempts}/${this.config.searchSettings?.retryMobileSearchAmount ?? 2}: Unable to complete mobile searches. Retrying once...`, 'log', 'yellow')
 
-                    // Close mobile browser
+                    // Close mobile browser and attempt one more time only
                     await this.browser.func.closeBrowser(browser, account.email)
 
-                    // Create a new browser and try
-                    await this.Mobile(account)
-                    return
+                    // Create a new MicrosoftRewardsBot instance to run Mobile again (single retry)
+                    const retryInstance = new MicrosoftRewardsBot(true)
+                    retryInstance.axios = this.axios
+                    retryInstance.config = this.config
+                    retryInstance.utils = this.utils
+
+                    try {
+                        await retryInstance.Mobile(account)
+                        return
+                    } catch (err) {
+                        rlog(this.isMobile, 'MAIN', `Mobile retry failed for ${account.email}: ${err}`, 'warn')
+                        return
+                    }
                 }
             } else {
                 rlog(this.isMobile, 'MAIN', 'Unable to fetch search points, your account is most likely too "new" for this! Try again later!', 'warn')
