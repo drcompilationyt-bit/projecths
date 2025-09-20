@@ -1,3 +1,4 @@
+import https from 'https'
 import { BrowserContext, Page } from 'rebrowser-playwright'
 import { CheerioAPI, load } from 'cheerio'
 import { AxiosRequestConfig } from 'axios'
@@ -18,11 +19,22 @@ export default class BrowserFunc {
         this.bot = bot
     }
 
+    /**
+     * Helper: quiet randomized delay between 30-45 seconds to reduce race/timeout issues.
+     */
+    private async quietDelay() {
+        const ms = 30000 + Math.floor(Math.random() * 15001) // 30,000 - 45,000 ms
+        if (this.bot && this.bot.utils && typeof (this.bot.utils as any).wait === 'function') {
+            await (this.bot.utils as any).wait(ms)
+        } else {
+            await new Promise(resolve => setTimeout(resolve, ms))
+        }
+    }
 
     /**
      * Navigate the provided page to rewards homepage
      * @param {Page} page Playwright page
-    */
+     */
     async goHome(page: Page) {
 
         try {
@@ -33,6 +45,9 @@ export default class BrowserFunc {
             }
 
             await page.goto(this.bot.config.baseURL)
+
+            // slight randomized delay after navigation
+            await this.quietDelay()
 
             const maxIterations = 5 // Maximum iterations set to 5
 
@@ -65,6 +80,8 @@ export default class BrowserFunc {
 
                     await this.bot.utils.wait(2000)
                     await page.goto(this.bot.config.baseURL)
+                    // small delay after re-navigation
+                    await this.quietDelay()
                 } else {
                     this.bot.log(this.bot.isMobile, 'GO-HOME', 'Visited homepage successfully')
                     break
@@ -74,14 +91,16 @@ export default class BrowserFunc {
             }
 
         } catch (error) {
-            throw this.bot.log(this.bot.isMobile, 'GO-HOME', 'An error occurred:' + error, 'error')
+            // Log and rethrow a real Error so callers don't receive `undefined`
+            this.bot.log(this.bot.isMobile, 'GO-HOME', 'An error occurred:' + error, 'error')
+            throw new Error('GO-HOME error: ' + error)
         }
     }
 
     /**
      * Fetch user dashboard data
      * @returns {DashboardData} Object of user bing rewards dashboard data
-    */
+     */
     async getDashboardData(): Promise<DashboardData> {
         const dashboardURL = new URL(this.bot.config.baseURL)
         const currentURL = new URL(this.bot.homePage.url())
@@ -96,6 +115,9 @@ export default class BrowserFunc {
             // Reload the page to get new data
             await this.bot.homePage.reload({ waitUntil: 'domcontentloaded' })
 
+            // slight randomized delay before extracting dashboard data
+            await this.quietDelay()
+
             const scriptContent = await this.bot.homePage.evaluate(() => {
                 const scripts = Array.from(document.querySelectorAll('script'))
                 const targetScript = scripts.find(script => script.innerText.includes('var dashboard'))
@@ -104,7 +126,8 @@ export default class BrowserFunc {
             })
 
             if (!scriptContent) {
-                throw this.bot.log(this.bot.isMobile, 'GET-DASHBOARD-DATA', 'Dashboard data not found within script', 'error')
+                this.bot.log(this.bot.isMobile, 'GET-DASHBOARD-DATA', 'Dashboard data not found within script', 'error')
+                throw new Error('Dashboard data not found within script')
             }
 
             // Extract the dashboard object from the script content
@@ -120,13 +143,15 @@ export default class BrowserFunc {
             }, scriptContent)
 
             if (!dashboardData) {
-                throw this.bot.log(this.bot.isMobile, 'GET-DASHBOARD-DATA', 'Unable to parse dashboard script', 'error')
+                this.bot.log(this.bot.isMobile, 'GET-DASHBOARD-DATA', 'Unable to parse dashboard script', 'error')
+                throw new Error('Unable to parse dashboard script')
             }
 
             return dashboardData
 
         } catch (error) {
-            throw this.bot.log(this.bot.isMobile, 'GET-DASHBOARD-DATA', `Error fetching dashboard data: ${error}`, 'error')
+            this.bot.log(this.bot.isMobile, 'GET-DASHBOARD-DATA', `Error fetching dashboard data: ${error}`, 'error')
+            throw new Error('GET-DASHBOARD-DATA error: ' + error)
         }
 
     }
@@ -134,7 +159,7 @@ export default class BrowserFunc {
     /**
      * Get search point counters
      * @returns {Counters} Object of search counter data
-    */
+     */
     async getSearchPoints(): Promise<Counters> {
         const dashboardData = await this.getDashboardData() // Always fetch newest data
 
@@ -144,9 +169,12 @@ export default class BrowserFunc {
     /**
      * Get total earnable points with web browser
      * @returns {number} Total earnable points
-    */
+     */
     async getBrowserEarnablePoints(): Promise<EarnablePoints> {
         try {
+            // small randomized delay to reduce rate/ordering issues
+            await this.quietDelay()
+
             let desktopSearchPoints = 0
             let mobileSearchPoints = 0
             let dailySetPoints = 0
@@ -187,16 +215,21 @@ export default class BrowserFunc {
                 totalEarnablePoints
             }
         } catch (error) {
-            throw this.bot.log(this.bot.isMobile, 'GET-BROWSER-EARNABLE-POINTS', 'An error occurred:' + error, 'error')
+            this.bot.log(this.bot.isMobile, 'GET-BROWSER-EARNABLE-POINTS', 'An error occurred:' + error, 'error')
+            throw new Error('GET-BROWSER-EARNABLE-POINTS error: ' + error)
         }
     }
 
     /**
      * Get total earnable points with mobile app
-     * @returns {number} Total earnable points
-    */
-    async getAppEarnablePoints(accessToken: string) {
+     * @returns {object} Total earnable points for mobile app (readToEarn, checkIn, totalEarnablePoints, fetchError)
+     */
+    async getAppEarnablePoints(accessToken: string): Promise<{ readToEarn: number, checkIn: number, totalEarnablePoints: number, fetchError?: boolean }> {
+        // This function now sets fetchError=true when network/parsing/certificate failures occur.
         try {
+            // slight randomized delay before calling app API
+            await this.quietDelay()
+
             const points = {
                 readToEarn: 0,
                 checkIn: 0,
@@ -219,12 +252,56 @@ export default class BrowserFunc {
                     'Authorization': `Bearer ${accessToken}`,
                     'X-Rewards-Country': geoLocale,
                     'X-Rewards-Language': 'en'
+                },
+                // note: httpsAgent is added only on retry when a cert error is detected
+            }
+
+            // Try regular request first
+            let userDataResponse: AppUserData | undefined
+            try {
+                userDataResponse = (await this.bot.axios.request(userDataRequest)).data as AppUserData
+            } catch (err: any) {
+                const msg = (err && (err.message || '')).toString().toLowerCase()
+                const code = err && err.code
+
+                const isCertError =
+                    msg.includes('unable to verify the first certificate') ||
+                    msg.includes('self signed certificate') ||
+                    msg.includes('unable to get local issuer certificate') ||
+                    code === 'DEPTH_ZERO_SELF_SIGNED_CERT' ||
+                    code === 'UNABLE_TO_VERIFY_LEAF_SIGNATURE' ||
+                    code === 'ERR_TLS_CERT_ALTNAME_INVALID'
+
+                if (isCertError) {
+                    this.bot.log(this.bot.isMobile, 'GET-APP-EARNABLE-POINTS', 'Certificate verification failed — retrying once with relaxed SSL (insecure).', 'warn')
+
+                    const insecureRequest: AxiosRequestConfig = {
+                        ...userDataRequest,
+                        httpsAgent: new https.Agent({ rejectUnauthorized: false })
+                    }
+
+                    try {
+                        userDataResponse = (await this.bot.axios.request(insecureRequest)).data as AppUserData
+                        this.bot.log(this.bot.isMobile, 'GET-APP-EARNABLE-POINTS', 'Retry with relaxed SSL succeeded.', 'log')
+                    } catch (retryErr) {
+                        this.bot.log(this.bot.isMobile, 'GET-APP-EARNABLE-POINTS', `Retry with relaxed SSL failed: ${retryErr}`, 'error')
+                        // Return fetchError so caller knows this was a fetch failure
+                        return { ...points, fetchError: true }
+                    }
+                } else {
+                    // Not a certificate error — log and return fetchError
+                    this.bot.log(this.bot.isMobile, 'GET-APP-EARNABLE-POINTS', `Failed fetching user data: ${err}`, 'error')
+                    return { ...points, fetchError: true }
                 }
             }
 
-            const userDataResponse: AppUserData = (await this.bot.axios.request(userDataRequest)).data
+            if (!userDataResponse || !userDataResponse.response) {
+                this.bot.log(this.bot.isMobile, 'GET-APP-EARNABLE-POINTS', 'User data response missing or malformed', 'warn')
+                return { ...points, fetchError: true }
+            }
+
             const userData = userDataResponse.response
-            const eligibleActivities = userData.promotions.filter((x) => eligibleOffers.includes(x.attributes.offerid ?? ''))
+            const eligibleActivities = userData.promotions.filter((x: any) => eligibleOffers.includes(x.attributes.offerid ?? ''))
 
             for (const item of eligibleActivities) {
                 if (item.attributes.type === 'msnreadearn') {
@@ -242,23 +319,26 @@ export default class BrowserFunc {
 
             points.totalEarnablePoints = points.readToEarn + points.checkIn
 
-            return points
+            return { ...points, fetchError: false }
         } catch (error) {
-            throw this.bot.log(this.bot.isMobile, 'GET-APP-EARNABLE-POINTS', 'An error occurred:' + error, 'error')
+            // Log and return fetchError so caller can detect this case
+            this.bot.log(this.bot.isMobile, 'GET-APP-EARNABLE-POINTS', 'An error occurred: ' + error, 'error')
+            return { readToEarn: 0, checkIn: 0, totalEarnablePoints: 0, fetchError: true }
         }
     }
 
     /**
      * Get current point amount
      * @returns {number} Current total point amount
-    */
+     */
     async getCurrentPoints(): Promise<number> {
         try {
             const data = await this.getDashboardData()
 
             return data.userStatus.availablePoints
         } catch (error) {
-            throw this.bot.log(this.bot.isMobile, 'GET-CURRENT-POINTS', 'An error occurred:' + error, 'error')
+            this.bot.log(this.bot.isMobile, 'GET-CURRENT-POINTS', 'An error occurred:' + error, 'error')
+            throw new Error('GET-CURRENT-POINTS error: ' + error)
         }
     }
 
@@ -266,11 +346,14 @@ export default class BrowserFunc {
      * Parse quiz data from provided page
      * @param {Page} page Playwright page
      * @returns {QuizData} Quiz data object
-    */
+     */
     async getQuizData(page: Page): Promise<QuizData> {
         try {
             const html = await page.content()
             const $ = load(html)
+
+            // slight randomized delay after loading quiz page content
+            await this.quietDelay()
 
             const scriptContent = $('script').filter((index, element) => {
                 return $(element).text().includes('_w.rewardsQuizRenderInfo')
@@ -284,14 +367,17 @@ export default class BrowserFunc {
                     const quizData = JSON.parse(match[1])
                     return quizData
                 } else {
-                    throw this.bot.log(this.bot.isMobile, 'GET-QUIZ-DATA', 'Quiz data not found within script', 'error')
+                    this.bot.log(this.bot.isMobile, 'GET-QUIZ-DATA', 'Quiz data not found within script', 'error')
+                    throw new Error('Quiz data not found within script')
                 }
             } else {
-                throw this.bot.log(this.bot.isMobile, 'GET-QUIZ-DATA', 'Script containing quiz data not found', 'error')
+                this.bot.log(this.bot.isMobile, 'GET-QUIZ-DATA', 'Script containing quiz data not found', 'error')
+                throw new Error('Script containing quiz data not found')
             }
 
         } catch (error) {
-            throw this.bot.log(this.bot.isMobile, 'GET-QUIZ-DATA', 'An error occurred:' + error, 'error')
+            this.bot.log(this.bot.isMobile, 'GET-QUIZ-DATA', 'An error occurred:' + error, 'error')
+            throw new Error('GET-QUIZ-DATA error: ' + error)
         }
 
     }
@@ -332,6 +418,9 @@ export default class BrowserFunc {
             const html = await page.content()
             const $ = load(html)
 
+            // slight randomized delay after loading punch-card page content
+            await this.quietDelay()
+
             const element = $('.offer-cta').toArray().find(x => x.attribs.href?.includes(activity.offerId))
             if (element) {
                 selector = `a[href*="${element.attribs.href}"]`
@@ -345,6 +434,9 @@ export default class BrowserFunc {
 
     async closeBrowser(browser: BrowserContext, email: string) {
         try {
+            // slight randomized delay before saving session & closing
+            await this.quietDelay()
+
             // Save cookies
             await saveSessionData(this.bot.config.sessionPath, browser, email, this.bot.isMobile)
 
@@ -354,7 +446,8 @@ export default class BrowserFunc {
             await browser.close()
             this.bot.log(this.bot.isMobile, 'CLOSE-BROWSER', 'Browser closed cleanly!')
         } catch (error) {
-            throw this.bot.log(this.bot.isMobile, 'CLOSE-BROWSER', 'An error occurred:' + error, 'error')
+            this.bot.log(this.bot.isMobile, 'CLOSE-BROWSER', 'An error occurred:' + error, 'error')
+            throw new Error('CLOSE-BROWSER error: ' + error)
         }
     }
 }
